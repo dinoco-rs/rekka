@@ -52,7 +52,6 @@ impl RekkaRecursiveWorker {
                 name: self.name,
                 key_name: self.name.to_owned(),
                 source: EventSource::Recursive,
-                run_on_start: false,
                 internal: false,
                 interval: self.interval,
                 lease: self.lease,
@@ -69,6 +68,8 @@ pub struct RecursiveWorker {
 }
 
 impl RecursiveWorker {
+    /// Reconcile segue o mesmo agendamento compartilhado de um worker recorrente: uma única
+    /// instância por ciclo, inclusive na subida (sem agendamento no Redis, roda na hora).
     pub(crate) fn reconcile<F, M>(index: usize, interval: Duration, f: F) -> Self
     where
         F: TaskFn<M>,
@@ -79,7 +80,6 @@ impl RecursiveWorker {
                 name: "reconcile",
                 key_name: format!("__reconcile_{index}"),
                 source: EventSource::Reconcile,
-                run_on_start: true,
                 internal: false,
                 interval,
                 lease: Duration::from_secs(30),
@@ -102,7 +102,6 @@ impl RecursiveWorker {
                 name,
                 key_name,
                 source: EventSource::Recursive,
-                run_on_start: false,
                 internal: true,
                 interval,
                 lease: Duration::from_secs(30),
@@ -130,7 +129,6 @@ struct RecursiveSpec<F, M> {
     name: &'static str,
     key_name: String,
     source: EventSource,
-    run_on_start: bool,
     internal: bool,
     interval: Duration,
     lease: Duration,
@@ -191,12 +189,6 @@ where
             warn!(name = rt.spec.name, error = %e, "rekka: failed to initialize the shared schedule");
         }
     }
-    if rt.spec.run_on_start {
-        rt.run(None, &env).await;
-        if let Err(e) = rt.bump(false).await {
-            warn!(name = rt.spec.name, error = %e, "rekka: failed to update the shared schedule");
-        }
-    }
 
     while !env.token.is_cancelled() {
         seq += 1;
@@ -204,7 +196,7 @@ where
         let wait = match rt.claim(&token).await {
             Ok((1, _)) => {
                 backoff.reset();
-                rt.run(Some(&token), &env).await;
+                rt.run(&token, &env).await;
                 continue;
             }
             Ok((_, wait)) => {
@@ -240,8 +232,8 @@ where
         inv.invoke_async(&mut self.cx.client.conn()).await
     }
 
-    /// Executa uma vez. Com `lock`, mantém a lease viva enquanto executa e libera no fim.
-    async fn run(&self, lock: Option<&str>, env: &RecursiveEnv) {
+    /// Executa uma vez, mantendo a lease do lock `token` viva enquanto executa e liberando no fim.
+    async fn run(&self, token: &str, env: &RecursiveEnv) {
         let name = self.spec.name;
         let source = self.spec.source;
         let shared = &env.cx.client.shared;
@@ -268,7 +260,7 @@ where
                             Err(e) if e.is_panic() => Err(panic_message(e.into_panic())),
                             Err(_) => Err("aborted".to_owned()),
                         },
-                        _ = heartbeat.tick(), if lock.is_some() => self.extend(lock.unwrap_or_default(), env).await,
+                        _ = heartbeat.tick() => self.extend(token, env).await,
                         _ = env.token.cancelled(), if deadline.is_none() && shutdown_timeout.is_some() => {
                             deadline = shutdown_timeout.map(|t| Instant::now() + t);
                         }
@@ -281,12 +273,10 @@ where
             }
         };
 
-        if let Some(token) = lock {
-            let mut inv = self.keys.invocation(&scripts::REC_RELEASE_SCRIPT);
-            inv.arg(token);
-            if let Err(e) = inv.invoke_async::<i64>(&mut env.cx.client.conn()).await {
-                warn!(name, error = %e, "rekka: failed to release recursive worker lock");
-            }
+        let mut inv = self.keys.invocation(&scripts::REC_RELEASE_SCRIPT);
+        inv.arg(token);
+        if let Err(e) = inv.invoke_async::<i64>(&mut env.cx.client.conn()).await {
+            warn!(name, error = %e, "rekka: failed to release recursive worker lock");
         }
 
         let kind = if outcome.is_ok() { JobEventKind::Succeeded } else { JobEventKind::Failed };

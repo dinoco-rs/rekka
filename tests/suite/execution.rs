@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use rekka::chrono::Utc;
 use rekka::{
-    JobEventKind, JobHandler, RekkaClient, RekkaExecutionResult, RekkaQueue, RekkaState, RetryPolicy,
+    JobEventKind, JobHandler, JobState, RekkaClient, RekkaExecutionResult, RekkaQueue, RekkaState, Removed, RetryPolicy,
 };
 use serde::{Deserialize, Serialize};
 
@@ -272,5 +272,55 @@ async fn extractors_and_job_chaining() {
     q.immediate(FirstJob { task_id: "chain".into(), value: 4 }).await.unwrap();
     assert!(eventually(Duration::from_secs(5), || probe.count() == 2).await);
     assert_eq!(probe.runs_of("chain-next")[0].value, 40);
+    q.shutdown().await.unwrap();
+}
+
+#[derive(Serialize, Deserialize, RekkaQueue)]
+#[rekka(name = "orchestrator")]
+struct Orchestrator {
+    task_id: String,
+}
+
+#[derive(Serialize, Deserialize, RekkaQueue)]
+#[rekka(name = "reminder")]
+struct Reminder {
+    task_id: String,
+}
+
+/// Sem `.data(queues)`: o extractor `RekkaClient` basta para adicionar e remover jobs.
+async fn orchestrate(
+    h: JobHandler,
+    job: Orchestrator,
+    client: RekkaClient,
+    RekkaState(probe): RekkaState<Probe>,
+) -> rekka::Result<()> {
+    client.immediate(SecondJob { task_id: format!("{}-next", job.task_id), value: 7 }).await?;
+    client.schedule_in(Reminder { task_id: format!("{}-later", job.task_id) }, Duration::from_secs(3600)).await?;
+    let removed = client.remove::<Reminder>(format!("{}-reminder", job.task_id)).await?;
+    probe.record(h.task_id(), h.attempt(), i64::from(removed == Removed::Removed), 0);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn jobs_add_and_remove_jobs_through_the_client_extractor() {
+    let env = TestEnv::new();
+    let probe = Probe::new();
+    let q = env
+        .builder()
+        .data_arc(probe.clone())
+        .register::<Orchestrator>(|w| w.build_fn(orchestrate))
+        .register::<SecondJob>(|w| w.build_fn(second))
+        .start()
+        .await
+        .unwrap();
+
+    q.schedule_in(Reminder { task_id: "o1-reminder".into() }, Duration::from_secs(3600)).await.unwrap();
+    q.immediate(Orchestrator { task_id: "o1".into() }).await.unwrap();
+
+    assert!(eventually(Duration::from_secs(5), || probe.count_of("o1-next") == 1).await, "the enqueued job ran");
+    assert_eq!(probe.runs_of("o1-next")[0].value, 7);
+    assert_eq!(probe.runs_of("o1")[0].value, 1, "remove() found the scheduled job");
+    assert_eq!(q.state::<Reminder>("o1-reminder").await.unwrap(), None);
+    assert!(matches!(q.state::<Reminder>("o1-later").await.unwrap(), Some(JobState::Waiting { .. })));
     q.shutdown().await.unwrap();
 }

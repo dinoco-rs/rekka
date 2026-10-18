@@ -34,8 +34,123 @@ struct Both {
     task_id: String,
 }
 
+/// Chave dinâmica montada a partir de um campo da própria struct.
+#[derive(Serialize, Deserialize, RekkaCache, Debug, PartialEq, Clone)]
+#[rekka(name = "payments", key = "payments-{business_id}", ttl = "1m")]
+struct Payment {
+    business_id: i64,
+    amount: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+struct Owner {
+    id: u32,
+}
+
+/// Vários campos, campo aninhado, especificador de formato e chaves literais.
+#[derive(Serialize, Deserialize, RekkaCache, Debug, PartialEq, Clone)]
+#[rekka(key = "{tenant}:{owner.id:05}:{{v1}}")]
+struct Report {
+    tenant: String,
+    owner: Owner,
+}
+
+/// Template em struct genérica: o campo do template não precisa ser o tipo genérico.
+#[derive(Serialize, Deserialize, RekkaCache, Debug, PartialEq)]
+#[rekka(name = "wrapped", key = "w-{id}")]
+struct Wrapped<T> {
+    id: u8,
+    value: T,
+}
+
+/// TTL com unidade sem aspas: para o Rust, `10m` é o inteiro `10` com sufixo `m`.
+#[derive(Serialize, Deserialize, RekkaCache)]
+#[rekka(ttl = 1d)]
+struct DailyTtl {
+    id: u8,
+}
+
+#[derive(Serialize, Deserialize, RekkaCache)]
+#[rekka(ttl = 2h)]
+struct HourlyTtl {
+    id: u8,
+}
+
+#[derive(Serialize, Deserialize, RekkaCache)]
+#[rekka(ttl = 10m)]
+struct MinutesTtl {
+    id: u8,
+}
+
+#[derive(Serialize, Deserialize, RekkaCache)]
+#[rekka(ttl = 30s)]
+struct SecondsTtl {
+    id: u8,
+}
+
+#[derive(Serialize, Deserialize, RekkaCache)]
+#[rekka(ttl = 1h30m)]
+struct CombinedTtl {
+    id: u8,
+}
+
+#[derive(Serialize, Deserialize, RekkaCache)]
+#[rekka(ttl = "1d 12h")]
+struct SpacedTtl {
+    id: u8,
+}
+
 fn user(id: u64) -> User {
     User { id, name: format!("user {id}") }
+}
+
+#[test]
+fn ttl_accepts_units_with_and_without_quotes() {
+    let hour = Duration::from_secs(3600);
+    assert_eq!(DailyTtl::TTL, Some(hour * 24));
+    assert_eq!(HourlyTtl::TTL, Some(hour * 2));
+    assert_eq!(MinutesTtl::TTL, Some(Duration::from_secs(600)));
+    assert_eq!(SecondsTtl::TTL, Some(Duration::from_secs(30)));
+    assert_eq!(CombinedTtl::TTL, Some(Duration::from_secs(90 * 60)));
+    assert_eq!(SpacedTtl::TTL, Some(hour * 36));
+}
+
+#[test]
+fn derive_builds_dynamic_keys_from_fields() {
+    assert_eq!(Payment { business_id: 42, amount: 10 }.cache_key(), "payments-42");
+    assert_eq!(Payment { business_id: -7, amount: 10 }.cache_key(), "payments--7");
+    assert_eq!(Payment::NAMESPACE, "payments");
+    assert_eq!(Payment::TTL, Some(Duration::from_secs(60)));
+
+    let report = Report { tenant: "acme".into(), owner: Owner { id: 42 } };
+    assert_eq!(report.cache_key(), "acme:00042:{v1}");
+    assert_eq!(Report::NAMESPACE, "report");
+
+    assert_eq!(Wrapped { id: 3, value: "x".to_owned() }.cache_key(), "w-3");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dynamic_keys_round_trip() {
+    let env = TestEnv::new();
+    let cache = env.cache().await;
+    let payment = Payment { business_id: 42, amount: 990 };
+
+    cache.insert(&payment).await.unwrap();
+    assert_eq!(env.keys("cache:payments:*").await, vec![format!("{}:cache:payments:payments-42", env.prefix)]);
+    assert_eq!(cache.get::<Payment>("payments-42").await.unwrap(), Some(payment.clone()));
+    assert_eq!(cache.get::<Payment>(format!("payments-{}", payment.business_id)).await.unwrap(), Some(payment));
+    assert!((1..=60_000).contains(&pttl(&env, "payments:payments-42").await));
+
+    let reports = [
+        Report { tenant: "acme".into(), owner: Owner { id: 1 } },
+        Report { tenant: "acme".into(), owner: Owner { id: 2 } },
+    ];
+    cache.insert_many(&reports).await.unwrap();
+    let found = cache.get_many::<Report>(["acme:00002:{v1}", "acme:00003:{v1}", "acme:00001:{v1}"]).await.unwrap();
+    assert_eq!(found, vec![Some(reports[1].clone()), None, Some(reports[0].clone())]);
+
+    assert!(cache.remove::<Payment>("payments-42").await.unwrap());
+    assert_eq!(cache.get::<Payment>("payments-42").await.unwrap(), None);
 }
 
 #[test]

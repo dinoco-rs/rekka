@@ -137,8 +137,36 @@ async fn periodic_reconcile_is_coordinated_across_instances() {
         q.shutdown().await.unwrap();
     }
     let runs = db.runs.load(Ordering::SeqCst);
-    // 3 execuções de inicialização + ~3 ciclos coordenados (e não 3 por ciclo).
-    assert!((4..=8).contains(&runs), "reconcile ran {runs} times");
+    // ~4 ciclos coordenados (t = 0, 400, 800, 1200ms), e não 3 por ciclo nem um por instância na subida.
+    assert!((3..=5).contains(&runs), "reconcile ran {runs} times");
+}
+
+/// Várias instâncias subindo juntas executam o reconcile uma única vez, e reiniciar todas
+/// (um deploy) não executa de novo antes do próximo ciclo: igual a um worker recorrente.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn startup_reconcile_runs_once_across_instances() {
+    let env = TestEnv::new();
+    let probe = Probe::new();
+    let db = Db::with([invoice("once", 0)]);
+    let interval = Duration::from_secs(3600);
+    let ttl = Duration::from_secs(60);
+
+    let (a, b, c) = tokio::join!(
+        start(&env, &probe, &db, interval, ttl),
+        start(&env, &probe, &db, interval, ttl),
+        start(&env, &probe, &db, interval, ttl),
+    );
+    assert!(eventually(Duration::from_secs(5), || probe.count_of("once") == 1).await);
+    tokio::time::sleep(ms(500)).await;
+    assert_eq!(db.runs.load(Ordering::SeqCst), 1, "only one instance runs the startup reconcile");
+    for q in [&a, &b, &c] {
+        q.shutdown().await.unwrap();
+    }
+
+    let restarted = start(&env, &probe, &db, interval, ttl).await;
+    tokio::time::sleep(ms(500)).await;
+    assert_eq!(db.runs.load(Ordering::SeqCst), 1, "a restart follows the shared schedule");
+    restarted.shutdown().await.unwrap();
 }
 
 async fn add_many_reconcile(handler: ReconcileHandler, RekkaState(count): RekkaState<AtomicUsize>) -> rekka::Result<()> {

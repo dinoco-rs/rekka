@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+	<defs>
+		<linearGradient id="rekka-mark" x1="6" y1="2" x2="60" y2="64" gradientUnits="userSpaceOnUse">
+			<stop stop-color="#FF9152" />
+			<stop offset="1" stop-color="#E5341D" />
+		</linearGradient>
+	</defs>
+	<rect width="64" height="64" rx="15" fill="url(#rekka-mark)" />
+	<rect x="12" y="17" width="24" height="8" rx="4" fill="#fff" fill-opacity="0.5" />
+	<rect x="19" y="28" width="27" height="8" rx="4" fill="#fff" fill-opacity="0.75" />
+	<rect x="26" y="39" width="26" height="8" rx="4" fill="#fff" />
+</svg>

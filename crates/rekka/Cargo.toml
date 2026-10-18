@@ -5,6 +5,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "../../crates.md"
+keywords = ["redis", "queue", "jobs", "cache", "background"]
+categories = ["asynchronous", "caching", "concurrency"]
 
 [dependencies]
 chrono = "0.4.45"

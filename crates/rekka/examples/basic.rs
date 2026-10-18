@@ -93,7 +93,7 @@ fn event_handler(event: JobEvent) {
     }
 }
 
-/// Roda ao iniciar cada instância e depois a cada intervalo (uma instância por ciclo).
+/// Roda a cada intervalo em uma única instância por ciclo (na primeira subida, roda na hora).
 async fn reconcile_function(handler: ReconcileHandler) -> rekka::Result<()> {
     // Busca as tasks pendentes em algum lugar (ex.: banco de dados).
     // `add` só cria o que não existe: nunca duplica nem interrompe um job em andamento.

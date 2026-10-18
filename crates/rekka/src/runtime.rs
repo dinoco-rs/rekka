@@ -66,8 +66,9 @@ impl QueuesBuilder {
         self
     }
 
-    /// Executa `f` ao iniciar cada instância e depois a cada `interval`
-    /// (coordenado: apenas uma instância por ciclo).
+    /// Executa `f` a cada `interval` em uma única instância por ciclo, com o mesmo agendamento
+    /// compartilhado de um worker recorrente: com várias instâncias rodando, só uma executa.
+    /// Na primeira subida (sem agendamento no Redis), executa na hora.
     ///
     /// Use o extractor [`ReconcileHandler`](crate::ReconcileHandler) para (re)adicionar jobs
     /// sem duplicar nem interromper os que já existem.
