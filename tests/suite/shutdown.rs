@@ -96,3 +96,85 @@ async fn shutdown_timeout_returns_jobs_to_the_queue() {
     assert_eq!(probe.runs()[1].attempt, 2);
     b.shutdown().await.unwrap();
 }
+
+/// Escala horizontal: enquanto uma instância encerra (esperando um job em execução), outros
+/// servidores continuam enfileirando. Ela não pode pegar nada novo, mesmo com slots livres e
+/// recebendo as notificações da fila; quem pega é a instância que continua no ar.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutting_down_instance_ignores_jobs_enqueued_by_other_servers() {
+    let env = TestEnv::new();
+    let (probe, events) = (Probe::new(), Events::default());
+    let stopping = env
+        .builder()
+        .data_arc(probe.clone())
+        .data(Instance(1))
+        .on_event(events.handler())
+        .register::<SlowJob>(|w| w.concurrency(8).build_fn(slow))
+        .start()
+        .await
+        .unwrap();
+    let producer = env.producer().await;
+
+    producer.immediate(SlowJob { task_id: 0, sleep_ms: 1500, hang_on: 0 }).await.unwrap();
+    assert!(eventually(Duration::from_secs(3), || probe.count() == 1).await);
+
+    let shutdown = tokio::spawn({
+        let q = stopping.clone();
+        async move { q.shutdown().await }
+    });
+    tokio::time::sleep(ms(50)).await;
+    // Outro servidor enfileira durante o encerramento: imediatos e um agendado para daqui a pouco.
+    producer.immediate_many((1..=5).map(|task_id| SlowJob { task_id, sleep_ms: 0, hang_on: 0 })).await.unwrap();
+    producer.schedule_in(SlowJob { task_id: 6, sleep_ms: 0, hang_on: 0 }, ms(300)).await.unwrap();
+    tokio::time::sleep(ms(700)).await;
+    assert_eq!(probe.count(), 1, "the stopping instance claimed new jobs: {:?}", probe.per_task());
+
+    shutdown.await.unwrap().unwrap();
+    assert_eq!(probe.count(), 1);
+    let stats = producer.stats::<SlowJob>().await.unwrap();
+    assert_eq!((stats.waiting, stats.running), (6, 0), "new jobs stay in the queue for other instances");
+
+    // Uma instância que continua no ar processa tudo.
+    let other = builder(&env, &probe, &events, 2).start().await.unwrap();
+    assert!(eventually(Duration::from_secs(5), || probe.count() == 7).await);
+    assert!(probe.runs()[1..].iter().all(|r| r.instance == 2));
+    other.shutdown().await.unwrap();
+}
+
+/// Shutdown em um momento qualquer no meio de um backlog grande (inclusive durante um claim):
+/// nenhum job fica preso como "executando" e os que não executaram voltam sem gastar tentativa.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_mid_backlog_leaves_no_claimed_jobs_behind() {
+    for round in 0..5u64 {
+        let env = TestEnv::new();
+        let (probe, events) = (Probe::new(), Events::default());
+        let producer = env.producer().await;
+        let total = 1500u32;
+        producer.immediate_many((0..total).map(|task_id| SlowJob { task_id, sleep_ms: 0, hang_on: 0 })).await.unwrap();
+
+        let q = env
+            .builder()
+            .data_arc(probe.clone())
+            .data(Instance(1))
+            .on_event(events.handler())
+            .register::<SlowJob>(|w| w.concurrency(128).build_fn(slow))
+            .start()
+            .await
+            .unwrap();
+        tokio::time::sleep(ms(5 + round * 7)).await;
+        q.shutdown().await.unwrap();
+
+        let ran = probe.count() as u64;
+        let stats = producer.stats::<SlowJob>().await.unwrap();
+        assert_eq!(stats.running, 0, "round {round}: jobs left claimed after shutdown");
+        assert_eq!(stats.waiting + ran, u64::from(total), "round {round}: lost or duplicated jobs");
+        let done: std::collections::HashSet<String> = probe.runs().into_iter().map(|r| r.task_id).collect();
+        for task_id in (0..total).filter(|id| !done.contains(&id.to_string())).take(200) {
+            let state = producer.state::<SlowJob>(task_id).await.unwrap();
+            assert!(
+                matches!(state, Some(JobState::Waiting { attempts: 0, .. })),
+                "round {round}: job {task_id} is {state:?}"
+            );
+        }
+    }
+}

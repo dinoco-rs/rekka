@@ -25,7 +25,7 @@ use crate::job::{RekkaQueue, ToTaskId};
 use crate::keys::{QueueKeys, validate_name};
 use crate::recursive::{ErasedRecursive, RecursiveEnv, RecursiveWorker, RekkaRecursiveWorker};
 use crate::scripts;
-use crate::util::{Backoff, millis, stable_hash};
+use crate::util::{Backoff, millis, stable_hash, supervise};
 use crate::worker::{ErasedWorker, LoopEnv, RekkaWorker, Worker};
 
 /// Configuração das filas. Criado com [`Queues::new`] e iniciado com [`QueuesBuilder::start`].
@@ -246,7 +246,12 @@ impl QueuesBuilder {
             aborts.push(tracker.spawn(worker.into_future(env)).abort_handle());
         }
         if !channels.is_empty() {
-            aborts.push(tracker.spawn(notify_listener(client, channels, token.clone())).abort_handle());
+            let token = token.clone();
+            let listener = async move {
+                supervise("notify listener", "", &token, || notify_listener(client.clone(), channels.clone(), token.clone()))
+                    .await;
+            };
+            aborts.push(tracker.spawn(listener).abort_handle());
         }
         for recursive in self.recursive {
             let env = RecursiveEnv { cx: cx.clone(), token: token.clone(), shutdown_timeout: self.shutdown_timeout };

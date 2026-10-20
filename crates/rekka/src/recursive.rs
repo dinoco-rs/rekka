@@ -2,37 +2,107 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime, TimeZone, Utc};
 use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep, sleep_until};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::context::RekkaContext;
+use crate::cron::CronTime;
 use crate::error::Result;
 use crate::event::{EventSource, JobEvent, JobEventKind};
 use crate::handler::{IntoTaskResult, TaskFn};
 use crate::keys::RecursiveKeys;
 use crate::scripts;
-use crate::util::{AbortOnDrop, Backoff, millis, panic_message, random_token};
+use crate::util::{AbortOnDrop, Backoff, millis, panic_message, random_token, supervise};
 use crate::worker::BoxFuture;
 
 /// Espera máxima entre verificações do agendamento compartilhado.
 const MAX_WAIT: Duration = Duration::from_secs(30);
 
-/// Worker executado a cada `interval`. Em escala horizontal, apenas uma instância
-/// executa cada ciclo e nunca há duas execuções simultâneas (lock no Redis).
+/// Calcula a próxima execução de um `cron_time` no fuso configurado.
+type NextFn = Arc<dyn Fn(&CronTime, DateTime<Utc>) -> Option<DateTime<Utc>> + Send + Sync>;
+
+/// Quando um worker recorrente executa.
+pub(crate) enum Schedule {
+    /// A cada `interval`, contado do início da execução anterior. Na primeira subida, executa na hora.
+    Interval(Duration),
+    /// Nos instantes de uma expressão cron. Nunca executa na subida, só no próximo instante.
+    Cron { expr: String, parsed: std::result::Result<CronTime, String>, next: NextFn },
+}
+
+impl Schedule {
+    fn check(&self, name: &str) -> std::result::Result<(), String> {
+        match self {
+            Self::Interval(interval) if *interval < Duration::from_millis(10) => {
+                Err(format!("`{name}`: interval must be at least 10ms"))
+            }
+            Self::Interval(_) => Ok(()),
+            Self::Cron { expr, parsed: Err(e), .. } => Err(format!("`{name}`: invalid cron_time `{expr}`: {e}")),
+            Self::Cron { expr, parsed: Ok(cron), next } => match next(cron, Utc::now()) {
+                Some(_) => Ok(()),
+                None => Err(format!("`{name}`: cron_time `{expr}` never matches")),
+            },
+        }
+    }
+}
+
+/// Worker executado a cada `interval` ou nos instantes de um `cron_time`. Em escala horizontal,
+/// apenas uma instância executa cada ciclo e nunca há duas execuções simultâneas (lock no Redis).
 pub struct RekkaRecursiveWorker {
     name: &'static str,
     interval: Duration,
+    cron: Option<String>,
+    timezone: NextFn,
     lease: Duration,
 }
 
 impl RekkaRecursiveWorker {
     pub fn new(name: &'static str) -> Self {
-        Self { name, interval: Duration::from_secs(60), lease: Duration::from_secs(30) }
+        Self {
+            name,
+            interval: Duration::from_secs(60),
+            cron: None,
+            timezone: Arc::new(|cron, after| cron.next_after(after, &Utc)),
+            lease: Duration::from_secs(30),
+        }
     }
 
+    /// Executa a cada `interval` (padrão 60s). Substitui um `cron_time` anterior.
     pub fn interval(mut self, interval: Duration) -> Self {
         self.interval = interval;
+        self.cron = None;
+        self
+    }
+
+    /// Executa nos instantes de uma expressão cron, como o `cronTime` do `node-cron`:
+    /// `segundo minuto hora dia mês dia-da-semana`, com o segundo opcional.
+    ///
+    /// ```text
+    /// "*/2 * * * *"     a cada 2 minutos
+    /// "*/10 * * * * *"  a cada 10 segundos
+    /// "0 30 9 * * 1-5"  09:30:00 de segunda a sexta
+    /// "0 0 1 * *"       meia-noite do dia 1 de cada mês
+    /// ```
+    ///
+    /// Campos aceitam `*`, `5`, `1-5`, `1,15,30`, `*/2`, `10-30/5` e nomes (`jan`, `mon`);
+    /// dia da semana vai de 0 a 7 (0 e 7 = domingo). Ao contrário de `interval`, não executa na
+    /// subida: a primeira execução é no próximo instante da expressão. Avaliada em UTC; mude com
+    /// [`timezone`](Self::timezone). Expressões inválidas fazem o `start()` falhar.
+    /// Substitui um `interval` anterior.
+    pub fn cron_time(mut self, expr: impl Into<String>) -> Self {
+        self.cron = Some(expr.into());
+        self
+    }
+
+    /// Fuso em que o `cron_time` é avaliado (padrão UTC): `chrono::FixedOffset`, `chrono::Local`
+    /// ou um fuso do `chrono-tz` (`chrono_tz::America::Sao_Paulo`). Use o mesmo fuso em todas as
+    /// instâncias.
+    pub fn timezone<Tz>(mut self, tz: Tz) -> Self
+    where
+        Tz: TimeZone + Send + Sync + 'static,
+    {
+        self.timezone = Arc::new(move |cron, after| cron.next_after(after, &tz));
         self
     }
 
@@ -47,13 +117,17 @@ impl RekkaRecursiveWorker {
         F: TaskFn<M>,
         M: 'static,
     {
+        let schedule = match self.cron {
+            Some(expr) => Schedule::Cron { parsed: CronTime::parse(&expr), expr, next: self.timezone },
+            None => Schedule::Interval(self.interval),
+        };
         RecursiveWorker {
             runner: Box::new(RecursiveSpec {
                 name: self.name,
                 key_name: self.name.to_owned(),
                 source: EventSource::Recursive,
                 internal: false,
-                interval: self.interval,
+                schedule,
                 lease: self.lease,
                 f,
                 _m: PhantomData,
@@ -81,7 +155,7 @@ impl RecursiveWorker {
                 key_name: format!("__reconcile_{index}"),
                 source: EventSource::Reconcile,
                 internal: false,
-                interval,
+                schedule: Schedule::Interval(interval),
                 lease: Duration::from_secs(30),
                 f,
                 _m: PhantomData,
@@ -103,7 +177,7 @@ impl RecursiveWorker {
                 key_name,
                 source: EventSource::Recursive,
                 internal: true,
-                interval,
+                schedule: Schedule::Interval(interval),
                 lease: Duration::from_secs(30),
                 f,
                 _m: PhantomData,
@@ -112,6 +186,7 @@ impl RecursiveWorker {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct RecursiveEnv {
     pub(crate) cx: RekkaContext,
     pub(crate) token: CancellationToken,
@@ -130,7 +205,7 @@ struct RecursiveSpec<F, M> {
     key_name: String,
     source: EventSource,
     internal: bool,
-    interval: Duration,
+    schedule: Schedule,
     lease: Duration,
     f: F,
     _m: PhantomData<fn() -> M>,
@@ -147,9 +222,7 @@ where
 
     fn check(&self) -> std::result::Result<(), String> {
         crate::keys::validate_name("recursive worker", self.name)?;
-        if self.interval < Duration::from_millis(10) {
-            return Err(format!("`{}`: interval must be at least 10ms", self.name));
-        }
+        self.schedule.check(self.name)?;
         if self.lease < Duration::from_millis(100) {
             return Err(format!("`{}`: lease must be at least 100ms", self.name));
         }
@@ -163,7 +236,12 @@ where
     fn into_future(self: Box<Self>, env: RecursiveEnv) -> BoxFuture {
         let keys = RecursiveKeys::new(&env.cx.client.shared.prefix, &self.key_name);
         let cx = env.cx.clone();
-        Box::pin(recursive_loop(Arc::new(RecursiveRt { spec: *self, keys, cx }), env))
+        let rt = Arc::new(RecursiveRt { spec: *self, keys, cx });
+        let token = env.token.clone();
+        Box::pin(async move {
+            let name = rt.spec.name;
+            supervise("recursive worker", name, &token, || recursive_loop(Arc::clone(&rt), env.clone())).await;
+        })
     }
 }
 
@@ -193,7 +271,13 @@ where
     while !env.token.is_cancelled() {
         seq += 1;
         let token = format!("{instance}:{seq}");
-        let wait = match rt.claim(&token).await {
+        let claimed = match &rt.spec.schedule {
+            Schedule::Interval(interval) => rt.claim(&token, *interval).await,
+            Schedule::Cron { parsed: Ok(cron), next, .. } => rt.claim_cron(&token, cron, next).await,
+            // Rejeitado no `check`.
+            Schedule::Cron { parsed: Err(_), .. } => return,
+        };
+        let wait = match claimed {
             Ok((1, _)) => {
                 backoff.reset();
                 rt.run(&token, &env).await;
@@ -220,15 +304,51 @@ where
     F: TaskFn<M>,
     M: 'static,
 {
-    async fn claim(&self, token: &str) -> std::result::Result<(i64, i64), redis::RedisError> {
+    async fn claim(&self, token: &str, interval: Duration) -> std::result::Result<(i64, i64), redis::RedisError> {
         let mut inv = self.keys.invocation(&scripts::REC_CLAIM_SCRIPT);
-        inv.arg(token).arg(millis(self.spec.interval)).arg(millis(self.spec.lease));
+        inv.arg(token).arg(millis(interval)).arg(millis(self.spec.lease));
         inv.invoke_async(&mut self.cx.client.conn()).await
     }
 
+    /// Mesmo contrato de [`claim`](Self::claim) para um `cron_time`: `(1, _)` = executar agora,
+    /// `(0, espera_ms)` = verificar de novo depois. A próxima execução é calculada a partir do
+    /// relógio do Redis, então todas as instâncias chegam no mesmo instante.
+    async fn claim_cron(
+        &self,
+        token: &str,
+        cron: &CronTime,
+        next: &NextFn,
+    ) -> std::result::Result<(i64, i64), redis::RedisError> {
+        let mut conn = self.cx.client.conn();
+        let (due, now, pttl): (i64, i64, i64) =
+            self.keys.invocation(&scripts::REC_PEEK_SCRIPT).invoke_async(&mut conn).await?;
+        if pttl != -2 {
+            // Executando em alguma instância.
+            return Ok((0, if due > now { due - now } else if pttl > 0 { pttl } else { 1000 }));
+        }
+        if due > now {
+            return Ok((0, due - now));
+        }
+        let Some(following) = Utc.timestamp_millis_opt(now).single().and_then(|now| next(cron, now)) else {
+            warn!(name = self.spec.name, "rekka: cron_time has no future occurrence");
+            return Ok((0, millis(MAX_WAIT) as i64));
+        };
+        let following = following.timestamp_millis();
+        let mut inv = self.keys.invocation(&scripts::REC_CRON_CLAIM_SCRIPT);
+        inv.arg(token).arg(due).arg(following).arg(millis(self.spec.lease));
+        match inv.invoke_async::<i64>(&mut conn).await? {
+            1 => Ok((1, 0)),
+            // Sem agendamento (primeira subida): agendado para o próximo instante, sem executar.
+            _ if due < 0 => Ok((0, following - now)),
+            // Outra instância levou: verifica de novo.
+            _ => Ok((0, 1)),
+        }
+    }
+
     async fn bump(&self, only_if_absent: bool) -> std::result::Result<i64, redis::RedisError> {
+        let Schedule::Interval(interval) = &self.spec.schedule else { return Ok(0) };
         let mut inv = self.keys.invocation(&scripts::REC_BUMP_SCRIPT);
-        inv.arg(millis(self.spec.interval)).arg(millis(self.spec.lease)).arg(u8::from(only_if_absent));
+        inv.arg(millis(*interval)).arg(millis(self.spec.lease)).arg(u8::from(only_if_absent));
         inv.invoke_async(&mut self.cx.client.conn()).await
     }
 
@@ -298,8 +418,16 @@ where
     async fn extend(&self, token: &str, env: &RecursiveEnv) {
         let mut inv = self.keys.invocation(&scripts::REC_EXTEND_SCRIPT);
         inv.arg(token).arg(millis(self.spec.lease));
-        if let Err(e) = inv.invoke_async::<i64>(&mut env.cx.client.conn()).await {
-            warn!(name = self.spec.name, error = %e, "rekka: failed to extend recursive worker lock");
+        match inv.invoke_async::<i64>(&mut env.cx.client.conn()).await {
+            Ok(1) => {}
+            // O lock expirou (Redis fora do ar por mais que a lease, restart sem persistência):
+            // retomado para nenhuma outra instância começar enquanto esta ainda executa.
+            Ok(2) => warn!(name = self.spec.name, "rekka: recursive worker lock expired while running; re-acquired"),
+            Ok(_) => warn!(
+                name = self.spec.name,
+                "rekka: recursive worker lock was taken by another instance while running"
+            ),
+            Err(e) => warn!(name = self.spec.name, error = %e, "rekka: failed to extend recursive worker lock"),
         }
     }
 }

@@ -47,6 +47,28 @@ struct Owner {
     id: u32,
 }
 
+/// Exemplo do `get` hidratado: basta passar o `session_id`.
+#[derive(Serialize, Deserialize, RekkaCache, Debug, PartialEq, Clone)]
+#[rekka(key = "session:{session_id}", ttl = "1m")]
+struct Session {
+    session_id: i64,
+    user: String,
+}
+
+/// Template só com o campo e um especificador de formato: o valor é sempre hidratado.
+#[derive(Serialize, Deserialize, RekkaCache, Debug, PartialEq, Clone)]
+#[rekka(key = "{id:05}")]
+struct Padded {
+    id: u32,
+}
+
+/// Especificador de tipo (`x`): não dá para hidratar a partir de qualquer valor, só a chave completa.
+#[derive(Serialize, Deserialize, RekkaCache, Debug, PartialEq, Clone)]
+#[rekka(key = "hex-{id:x}")]
+struct Hex {
+    id: u32,
+}
+
 /// Vários campos, campo aninhado, especificador de formato e chaves literais.
 #[derive(Serialize, Deserialize, RekkaCache, Debug, PartialEq, Clone)]
 #[rekka(key = "{tenant}:{owner.id:05}:{{v1}}")]
@@ -137,8 +159,8 @@ async fn dynamic_keys_round_trip() {
 
     cache.insert(&payment).await.unwrap();
     assert_eq!(env.keys("cache:payments:*").await, vec![format!("{}:cache:payments:payments-42", env.prefix)]);
-    assert_eq!(cache.get::<Payment>("payments-42").await.unwrap(), Some(payment.clone()));
-    assert_eq!(cache.get::<Payment>(format!("payments-{}", payment.business_id)).await.unwrap(), Some(payment));
+    assert_eq!(cache.get::<Payment>("payments-42").await, Some(payment.clone()));
+    assert_eq!(cache.get::<Payment>(format!("payments-{}", payment.business_id)).await, Some(payment));
     assert!((1..=60_000).contains(&pttl(&env, "payments:payments-42").await));
 
     let reports = [
@@ -150,7 +172,64 @@ async fn dynamic_keys_round_trip() {
     assert_eq!(found, vec![Some(reports[1].clone()), None, Some(reports[0].clone())]);
 
     assert!(cache.remove::<Payment>("payments-42").await.unwrap());
-    assert_eq!(cache.get::<Payment>("payments-42").await.unwrap(), None);
+    assert_eq!(cache.get::<Payment>("payments-42").await, None);
+}
+
+#[test]
+fn resolve_key_hydrates_single_field_templates() {
+    assert_eq!(Session::resolve_key(42), "session:42");
+    assert_eq!(Session::resolve_key(-7), "session:-7");
+    assert_eq!(Session::resolve_key("session:42"), "session:42");
+    assert_eq!(Session::resolve_key("abc"), "session:abc");
+    // Só o prefixo não é uma chave completa: o campo precisa de pelo menos um caractere.
+    assert_eq!(Session::resolve_key("session:"), "session:session:");
+    assert_eq!(Session::resolve_key(""), "");
+
+    assert_eq!(Payment::resolve_key(42), "payments-42");
+    assert_eq!(Payment::resolve_key("payments-42"), "payments-42");
+    assert_eq!(Wrapped::<String>::resolve_key(3), "w-3");
+
+    assert_eq!(Padded::resolve_key(42), "00042");
+    assert_eq!(Padded::resolve_key("00042"), "00042");
+
+    assert_eq!(Hex::resolve_key("hex-ff"), "hex-ff");
+    assert_eq!(Report::resolve_key("acme:00042:{v1}"), "acme:00042:{v1}");
+    assert_eq!(User::resolve_key(7), "7");
+}
+
+#[test]
+fn key_template_matching() {
+    use rekka::__private::matches_key_template as m;
+    assert!(m("session:42", &["session:", ""]));
+    assert!(!m("session:", &["session:", ""]));
+    assert!(!m("42", &["session:", ""]));
+    assert!(m("acme:00042:{v1}", &["", ":", ":{v1}"]));
+    assert!(!m("acme:{v1}", &["", ":", ":{v1}"]));
+    assert!(m("ab", &["", "", ""]));
+    assert!(!m("a", &["", "", ""]));
+    assert!(m("é-1-x", &["", "-", "-x"]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_hydrates_the_key_from_the_field_value() {
+    let env = TestEnv::new();
+    let cache = env.cache().await;
+    let session = Session { session_id: 42, user: "ana".into() };
+
+    cache.insert(&session).await.unwrap();
+    assert_eq!(env.keys("cache:session:*").await, vec![format!("{}:cache:session:session:42", env.prefix)]);
+    assert_eq!(cache.get::<Session>(42).await, Some(session.clone()));
+    assert_eq!(cache.get::<Session>(42i64).await, Some(session.clone()));
+    assert_eq!(cache.get::<Session>("session:42").await, Some(session.clone()));
+    assert_eq!(cache.get::<Session>(43).await, None);
+    assert_eq!(cache.get_many::<Session>([42, 43]).await.unwrap(), vec![Some(session.clone()), None]);
+    assert!(cache.contains::<Session>(42).await.unwrap());
+
+    cache.insert(&Padded { id: 7 }).await.unwrap();
+    assert_eq!(cache.get::<Padded>(7).await, Some(Padded { id: 7 }));
+
+    assert!(cache.remove::<Session>(42).await.unwrap());
+    assert_eq!(cache.get::<Session>("session:42").await, None);
 }
 
 #[test]
@@ -181,17 +260,17 @@ async fn insert_get_contains_remove() {
     let cache = env.cache().await;
 
     cache.insert(&user(1)).await.unwrap();
-    assert_eq!(cache.get::<User>(1).await.unwrap(), Some(user(1)));
+    assert_eq!(cache.get::<User>(1).await, Some(user(1)));
     assert!(cache.contains::<User>(1).await.unwrap());
     assert_eq!(pttl(&env, "users:1").await, -1, "no ttl attribute means permanent");
 
     let renamed = User { id: 1, name: "renamed".into() };
     cache.insert(&renamed).await.unwrap();
-    assert_eq!(cache.get::<User>(1).await.unwrap(), Some(renamed));
+    assert_eq!(cache.get::<User>(1).await, Some(renamed));
 
     assert!(cache.remove::<User>(1).await.unwrap());
     assert!(!cache.remove::<User>(1).await.unwrap());
-    assert_eq!(cache.get::<User>(1).await.unwrap(), None);
+    assert_eq!(cache.get::<User>(1).await, None);
     assert!(!cache.contains::<User>(1).await.unwrap());
 }
 
@@ -210,9 +289,9 @@ async fn ttl_is_applied_and_entries_expire() {
 
     assert!(
         eventually_async(Duration::from_secs(3), || async {
-            cache.get::<Product>("p").await.unwrap().is_none()
-                && cache.get::<Product>("q").await.unwrap().is_none()
-                && cache.get::<User>(7).await.unwrap().is_none()
+            cache.get::<Product>("p").await.is_none()
+                && cache.get::<Product>("q").await.is_none()
+                && cache.get::<User>(7).await.is_none()
         })
         .await
     );
@@ -254,7 +333,8 @@ async fn empty_inputs_and_invalid_keys() {
     assert_eq!(cache.remove_many::<User>(Vec::<u64>::new()).await.unwrap(), 0);
 
     assert!(matches!(cache.insert(&Product { sku: String::new(), price: 0 }).await, Err(RekkaError::InvalidKey)));
-    assert!(matches!(cache.get::<Product>("").await, Err(RekkaError::InvalidKey)));
+    assert!(cache.get::<Product>("").await.is_none());
+    assert!(matches!(cache.contains::<Product>("").await, Err(RekkaError::InvalidKey)));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -268,7 +348,7 @@ async fn incompatible_entries_are_misses() {
         .await
         .unwrap();
 
-    assert_eq!(cache.get::<User>(9).await.unwrap(), None);
+    assert_eq!(cache.get::<User>(9).await, None);
     assert_eq!(cache.get_many::<User>([9, 10]).await.unwrap(), vec![None, None]);
 }
 
@@ -281,7 +361,7 @@ async fn clear_removes_only_its_namespace() {
 
     assert_eq!(cache.clear::<User>().await.unwrap(), 1500);
     assert!(cache.get_many::<User>(0..1500).await.unwrap().iter().all(Option::is_none));
-    assert!(cache.get::<Product>("keep").await.unwrap().is_some());
+    assert!(cache.get::<Product>("keep").await.is_some());
 }
 
 #[derive(Serialize, Deserialize, RekkaQueue)]
@@ -302,9 +382,9 @@ async fn cache_inside_jobs_and_from_queues() {
 
     q.immediate(WarmJob { task_id: 77 }).await.unwrap();
     let cache = q.cache();
-    assert!(eventually_async(Duration::from_secs(3), || async { cache.get::<User>(77).await.unwrap().is_some() }).await);
+    assert!(eventually_async(Duration::from_secs(3), || async { cache.get::<User>(77).await.is_some() }).await);
 
     // Mesmo prefixo: uma instância separada enxerga o mesmo dado.
-    assert_eq!(env.cache().await.get::<User>(77).await.unwrap(), Some(user(77)));
+    assert_eq!(env.cache().await.get::<User>(77).await, Some(user(77)));
     q.shutdown().await.unwrap();
 }

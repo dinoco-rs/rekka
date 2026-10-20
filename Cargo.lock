@@ -560,7 +560,7 @@ dependencies = [
 
 [[package]]
 name = "rekka"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "chrono",
  "fastrand",
@@ -576,7 +576,7 @@ dependencies = [
 
 [[package]]
 name = "rekka-tests"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "chrono",
  "redis",
@@ -589,7 +589,7 @@ dependencies = [
 
 [[package]]
 name = "rekka_derives"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "proc-macro2",
  "quote",

@@ -193,6 +193,27 @@ if act == 'd' then due = NOW + due end
 return retry(id, jk, due)
 ";
 
+/// Devolve para a fila, sem contar tentativa, jobs pegos que não chegaram a executar (o
+/// encerramento começou durante o claim). ARGV: prefix, (id, attempt)... Retorna quantos voltaram.
+const RELEASE: &str = r"
+local n = 0
+for i = 2, #ARGV, 2 do
+  local id = ARGV[i]
+  local jk = jkey(id)
+  local f = redis.call('HMGET', jk, 's', 'a', 'rm')
+  if f[1] == 'r' and tonumber(f[2]) == tonumber(ARGV[i + 1]) then
+    if f[3] then
+      discard(id, jk)
+    else
+      redis.call('HINCRBY', jk, 'a', -1)
+      retry(id, jk, NOW)
+      n = n + 1
+    end
+  end
+end
+return n
+";
+
 /// ARGV: prefix, lease_ms, (id, attempt)...
 const EXTEND: &str = r"
 local lease = tonumber(ARGV[2])
@@ -449,10 +470,43 @@ redis.call('SET', NEXT, NOW + interval, 'PX', interval * 2 + lease)
 return {1, interval}
 ";
 
-/// ARGV: token, lease_ms
+/// ARGV: token, lease_ms. Retorna 1 = renovado, 2 = tinha expirado e foi retomado,
+/// 0 = outra instância detém o lock.
 const REC_EXTEND: &str = r"
-if redis.call('GET', LOCK) == ARGV[1] then return redis.call('PEXPIRE', LOCK, ARGV[2]) end
+local cur = redis.call('GET', LOCK)
+if cur == ARGV[1] then return redis.call('PEXPIRE', LOCK, ARGV[2]) end
+if not cur then
+  redis.call('SET', LOCK, ARGV[1], 'PX', ARGV[2])
+  return 2
+end
 return 0
+";
+
+/// Retorna `{próxima_execução_ms (-1 = sem agendamento), agora_ms, pttl_do_lock (-2 = livre)}`.
+const REC_PEEK: &str = r"
+local nx = redis.call('GET', NEXT)
+return {nx and tonumber(nx) or -1, NOW, redis.call('PTTL', LOCK)}
+";
+
+/// `cron_time`: se o agendamento ainda é `expected` (lido no `REC_PEEK`), está vencido e o lock
+/// está livre, pega o lock e agenda `next`. Com `expected = -1`, só cria o agendamento (a
+/// primeira execução é no próximo instante da expressão, nunca na subida).
+/// ARGV: token, expected_ms, next_ms, lease_ms. Retorna 1 (executar) ou 0.
+const REC_CRON_CLAIM: &str = r"
+local expected = tonumber(ARGV[2])
+local nx = tonumber(redis.call('GET', NEXT) or '-1')
+if nx ~= expected then return 0 end
+local nxt = tonumber(ARGV[3])
+local lease = tonumber(ARGV[4])
+local keep = math.max(nxt - NOW, 1) * 2 + lease
+if expected == -1 then
+  redis.call('SET', NEXT, nxt, 'PX', keep)
+  return 0
+end
+if nx > NOW or redis.call('EXISTS', LOCK) == 1 then return 0 end
+redis.call('SET', LOCK, ARGV[1], 'PX', lease)
+redis.call('SET', NEXT, nxt, 'PX', keep)
+return 1
 ";
 
 /// ARGV: token
@@ -484,6 +538,7 @@ pub(crate) static CLAIM_SCRIPT: LazyLock<Script> = LazyLock::new(|| queue_script
 pub(crate) static BIND_SCRIPT: LazyLock<Script> = LazyLock::new(|| queue_script(BIND));
 pub(crate) static COMPLETE_SCRIPT: LazyLock<Script> = LazyLock::new(|| queue_script(COMPLETE));
 pub(crate) static EXTEND_SCRIPT: LazyLock<Script> = LazyLock::new(|| queue_script(EXTEND));
+pub(crate) static RELEASE_SCRIPT: LazyLock<Script> = LazyLock::new(|| queue_script(RELEASE));
 pub(crate) static REAP_SCRIPT: LazyLock<Script> = LazyLock::new(|| queue_script(REAP));
 pub(crate) static ENQUEUE_SCRIPT: LazyLock<Script> = LazyLock::new(|| queue_script(ENQUEUE));
 pub(crate) static REMOVE_SCRIPT: LazyLock<Script> = LazyLock::new(|| queue_script(REMOVE));
@@ -496,14 +551,17 @@ pub(crate) static REC_CLAIM_SCRIPT: LazyLock<Script> = LazyLock::new(|| recursiv
 pub(crate) static REC_EXTEND_SCRIPT: LazyLock<Script> = LazyLock::new(|| recursive_script(REC_EXTEND));
 pub(crate) static REC_RELEASE_SCRIPT: LazyLock<Script> = LazyLock::new(|| recursive_script(REC_RELEASE));
 pub(crate) static REC_BUMP_SCRIPT: LazyLock<Script> = LazyLock::new(|| recursive_script(REC_BUMP));
+pub(crate) static REC_PEEK_SCRIPT: LazyLock<Script> = LazyLock::new(|| recursive_script(REC_PEEK));
+pub(crate) static REC_CRON_CLAIM_SCRIPT: LazyLock<Script> = LazyLock::new(|| recursive_script(REC_CRON_CLAIM));
 
 /// Todos os scripts, carregados no `start()` para falhar cedo.
-pub(crate) fn all() -> [&'static Script; 16] {
+pub(crate) fn all() -> [&'static Script; 19] {
     [
         &CLAIM_SCRIPT,
         &BIND_SCRIPT,
         &COMPLETE_SCRIPT,
         &EXTEND_SCRIPT,
+        &RELEASE_SCRIPT,
         &REAP_SCRIPT,
         &ENQUEUE_SCRIPT,
         &REMOVE_SCRIPT,
@@ -516,5 +574,7 @@ pub(crate) fn all() -> [&'static Script; 16] {
         &REC_EXTEND_SCRIPT,
         &REC_RELEASE_SCRIPT,
         &REC_BUMP_SCRIPT,
+        &REC_PEEK_SCRIPT,
+        &REC_CRON_CLAIM_SCRIPT,
     ]
 }

@@ -22,6 +22,13 @@ pub trait RekkaCache: Serialize + DeserializeOwned + Send + 'static {
     const TTL: Option<Duration>;
 
     fn cache_key(&self) -> String;
+
+    /// Chave completa a partir do que foi passado para `get`, `get_many`, `contains`, `remove` e
+    /// `remove_many`. Com `#[rekka(key = "session:{session_id}")]`, o derive aceita tanto a chave
+    /// completa (`"session:42"`) quanto só o valor do campo (`42`). Padrão: o valor como está.
+    fn resolve_key(key: impl Display) -> String {
+        key.to_string()
+    }
 }
 
 /// Cache tipado sobre Redis. Clonável e barato; também é um extractor dentro dos handlers.
@@ -89,8 +96,13 @@ impl Cache {
         Self { conn, prefix }
     }
 
+    /// Chave no Redis a partir do que o usuário passou (hidratada por [`RekkaCache::resolve_key`]).
     fn key<T: RekkaCache>(&self, key: impl Display) -> Result<String> {
-        let key = key.to_string();
+        self.full_key::<T>(T::resolve_key(key))
+    }
+
+    /// Chave no Redis a partir de uma chave já completa (`cache_key`).
+    fn full_key<T: RekkaCache>(&self, key: String) -> Result<String> {
         if key.is_empty() {
             return Err(RekkaError::InvalidKey);
         }
@@ -108,7 +120,7 @@ impl Cache {
     }
 
     async fn set<T: RekkaCache>(&self, item: &T, ttl: Option<Duration>) -> Result<()> {
-        let key = self.key::<T>(item.cache_key())?;
+        let key = self.full_key::<T>(item.cache_key())?;
         let value = serde_json::to_vec(item)?;
         let mut cmd = redis::cmd("SET");
         cmd.arg(key).arg(value);
@@ -127,7 +139,7 @@ impl Cache {
         while items.peek().is_some() {
             let mut pipe = redis::pipe();
             for item in items.by_ref().take(CHUNK) {
-                let cmd = pipe.cmd("SET").arg(self.key::<T>(item.cache_key())?).arg(serde_json::to_vec(item)?);
+                let cmd = pipe.cmd("SET").arg(self.full_key::<T>(item.cache_key())?).arg(serde_json::to_vec(item)?);
                 if let Some(ttl) = ttl {
                     cmd.arg("PX").arg(ttl);
                 }
@@ -138,10 +150,23 @@ impl Cache {
         Ok(())
     }
 
-    pub async fn get<T: RekkaCache>(&self, key: impl Display) -> Result<Option<T>> {
-        let key = self.key::<T>(key)?;
-        let raw: Option<Vec<u8>> = redis::cmd("GET").arg(&key).query_async(&mut self.conn.clone()).await?;
-        Ok(raw.and_then(|raw| decode(&key, &raw)))
+    /// Lê um item. Ausente, chave inválida, formato incompatível ou Redis indisponível: `None`
+    /// (o erro vai para o log), então o cache nunca derruba quem o consulta.
+    pub async fn get<T: RekkaCache>(&self, key: impl Display) -> Option<T> {
+        let key = match self.key::<T>(key) {
+            Ok(key) => key,
+            Err(e) => {
+                warn!(namespace = T::NAMESPACE, error = %e, "rekka: cache get failed");
+                return None;
+            }
+        };
+        match redis::cmd("GET").arg(&key).query_async::<Option<Vec<u8>>>(&mut self.conn.clone()).await {
+            Ok(raw) => raw.and_then(|raw| decode(&key, &raw)),
+            Err(e) => {
+                warn!(key, error = %e, "rekka: cache get failed");
+                None
+            }
+        }
     }
 
     /// Resultado na mesma ordem das chaves; `None` para as ausentes.

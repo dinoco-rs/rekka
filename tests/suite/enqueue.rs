@@ -44,10 +44,12 @@ async fn schedule_and_schedule_in_are_not_ready() {
     q.schedule(mail("at", 1), Utc::now() + chrono::Duration::hours(1)).await.unwrap();
     q.schedule_in(mail("in", 1), Duration::from_secs(600)).await.unwrap();
 
+    // `schedule` usa um instante deste relógio e o Redis mede com o dele: tolera alguns ms de
+    // diferença entre os dois (o Redis local já esteve 67 ms atrás).
     let Some(JobState::Waiting { run_in, .. }) = q.state::<MailJob>("at").await.unwrap() else { panic!() };
-    assert!(run_in > Duration::from_secs(3500) && run_in <= Duration::from_secs(3600));
+    assert!(run_in > Duration::from_secs(3500) && run_in <= Duration::from_secs(3601), "{run_in:?}");
     let Some(JobState::Waiting { run_in, .. }) = q.state::<MailJob>("in").await.unwrap() else { panic!() };
-    assert!(run_in > Duration::from_secs(590) && run_in <= Duration::from_secs(600));
+    assert!(run_in > Duration::from_secs(590) && run_in <= Duration::from_secs(600), "{run_in:?}");
 
     let stats = q.stats::<MailJob>().await.unwrap();
     assert_eq!((stats.waiting, stats.ready), (2, 0));

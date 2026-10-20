@@ -24,7 +24,7 @@ use crate::handler::JobFn;
 use crate::job::{IntoExecutionResult, JobHandler, RekkaExecutionResult, RekkaQueue, RetryPolicy};
 use crate::keys::QueueKeys;
 use crate::scripts;
-use crate::util::{Backoff, is_transient, millis, panic_message, random_between};
+use crate::util::{Backoff, is_transient, millis, panic_message, random_between, supervise};
 
 /// Máximo de jobs pegos por chamada do script de claim.
 const CLAIM_BATCH: usize = 128;
@@ -130,6 +130,7 @@ pub struct Worker<J> {
     pub(crate) runner: Box<dyn ErasedWorker>,
 }
 
+#[derive(Clone)]
 pub(crate) struct LoopEnv {
     pub(crate) cx: RekkaContext,
     pub(crate) token: CancellationToken,
@@ -189,7 +190,10 @@ where
             f,
             _m: PhantomData,
         });
-        Box::pin(queue_loop(rt, env))
+        // Um pânico no loop (bug da lib) não pode parar a fila: o loop recomeça e os jobs que
+        // estavam executando voltam pela lease (reaper).
+        let token = env.token.clone();
+        Box::pin(async move { supervise("queue", J::NAME, &token, || queue_loop(Arc::clone(&rt), env.clone())).await })
     }
 }
 
@@ -242,6 +246,12 @@ where
                 next_claim = Instant::now();
             }
         }
+        // O shutdown pode ter começado fora do select (durante um claim ou um finalize): nada novo
+        // é pego a partir daqui, mesmo com outros servidores enfileirando.
+        if !stopping && env.token.is_cancelled() {
+            stopping = true;
+            deadline = env.shutdown_timeout.map(|t| Instant::now() + t);
+        }
         if stopping && jobs.is_empty() {
             break;
         }
@@ -250,6 +260,11 @@ where
         if !stopping && free > 0 && Instant::now() >= next_claim {
             let want = free.min(CLAIM_BATCH);
             match rt.claim(want).await {
+                Ok((_, claimed)) if env.token.is_cancelled() => {
+                    // O shutdown começou durante o claim: devolve sem executar.
+                    rt.release(&claimed).await;
+                    continue;
+                }
                 Ok((delay, claimed)) => {
                     backoff.reset();
                     let got = claimed.len();
@@ -366,6 +381,22 @@ where
                     });
                 }
             }
+        }
+    }
+
+    /// Devolve jobs pegos que não vão executar, sem gastar tentativa. Se falhar (Redis fora),
+    /// eles voltam pela lease.
+    async fn release(&self, claimed: &[(String, String, u32, String)]) {
+        if claimed.is_empty() {
+            return;
+        }
+        let mut inv = self.keys.invocation(&scripts::RELEASE_SCRIPT);
+        for (id, _, attempt, _) in claimed {
+            inv.arg(id).arg(*attempt);
+        }
+        match inv.invoke_async::<u64>(&mut self.cx.client.conn()).await {
+            Ok(n) => debug!(queue = J::NAME, released = n, "rekka: shutdown started during claim; jobs returned"),
+            Err(e) => warn!(queue = J::NAME, error = %e, "rekka: failed to return claimed jobs; they come back after the lease"),
         }
     }
 

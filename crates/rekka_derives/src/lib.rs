@@ -20,7 +20,8 @@ pub fn derive_rekka_queue(input: TokenStream) -> TokenStream {
 /// - `#[rekka(key = campo)]` campo usado como chave (padrão: o campo `key` ou `id`).
 /// - `#[rekka(key = "payments-{business_id}")]` chave montada a partir dos campos da struct:
 ///   cada `{campo}` (ou `{campo.subcampo}`, com especificador opcional como `{id:05}`) vira o
-///   valor do campo; `{{` e `}}` são chaves literais.
+///   valor do campo; `{{` e `}}` são chaves literais. Com um único `{campo}`, `get`/`contains`/
+///   `remove` aceitam só o valor (`cache.get::<T>(42)` busca `payments-42`) ou a chave completa.
 /// - `#[rekka(ttl = 60000)]` TTL em milissegundos, ou uma duração com unidade, com ou sem aspas:
 ///   `ttl = 30s`, `ttl = 10m`, `ttl = 2h`, `ttl = 7d`, `ttl = 1h30m`, `ttl = "1h 30m"`
 ///   (`ms`, `s`, `m`, `h`, `d`).
@@ -171,12 +172,17 @@ fn expand_cache(input: DeriveInput) -> syn::Result<TokenStream2> {
 
     let field_named = |name: &str| fields.iter().filter_map(|f| f.ident.as_ref()).find(|i| *i == name);
     let krate = attrs.krate();
+    let mut resolve_key = None;
     let cache_key = match &attrs.key {
         Some(KeySpec::Field(key)) => match field_named(&key.to_string()) {
             Some(field) => quote!(#krate::ToTaskId::to_task_id(&self.#field)),
             None => return Err(syn::Error::new_spanned(key, format!("`{}` não tem o campo `{key}`", input.ident))),
         },
-        Some(KeySpec::Template(lit)) => expand_key_template(lit, &input.ident, fields)?,
+        Some(KeySpec::Template(lit)) => {
+            let (cache_key, resolve) = expand_key_template(lit, &input.ident, fields, &krate)?;
+            resolve_key = resolve;
+            cache_key
+        }
         None => match field_named("key").or_else(|| field_named("id")) {
             Some(field) => quote!(#krate::ToTaskId::to_task_id(&self.#field)),
             None => {
@@ -206,16 +212,20 @@ fn expand_cache(input: DeriveInput) -> syn::Result<TokenStream2> {
             fn cache_key(&self) -> ::std::string::String {
                 #cache_key
             }
+
+            #resolve_key
         }
     })
 }
 
-/// `"payments-{business_id}"` -> `format!("payments-{}", &self.business_id)`.
+/// `"payments-{business_id}"` -> `format!("payments-{}", &self.business_id)`, mais o
+/// `resolve_key` que hidrata a chave a partir do valor do campo (só com um único `{campo}`).
 fn expand_key_template(
     lit: &LitStr,
     ident: &Ident,
     fields: &Punctuated<Field, Token![,]>,
-) -> syn::Result<TokenStream2> {
+    krate: &Path,
+) -> syn::Result<(TokenStream2, Option<TokenStream2>)> {
     let template = parse_key_template(&lit.value()).map_err(|message| syn::Error::new_spanned(lit, message))?;
     let mut args = Vec::with_capacity(template.placeholders.len());
     for path in &template.placeholders {
@@ -236,23 +246,57 @@ fn expand_key_template(
         args.push(quote!(&self #(. #segments)*));
     }
     let format = LitStr::new(&template.format, lit.span());
-    Ok(quote!(::std::format!(#format, #(#args),*)))
+    let cache_key = quote!(::std::format!(#format, #(#args),*));
+    Ok((cache_key, expand_resolve_key(&template, krate, lit.span())))
 }
 
-/// Template de chave já validado: a string de formato e o caminho de cada `{campo}`.
+/// `resolve_key` de um template com um único `{campo}`: a chave completa é usada como está;
+/// qualquer outro valor preenche o `{campo}`. Especificadores de tipo (`{id:x}`) só valem para o
+/// tipo do campo, então nesse caso o `get` exige a chave completa.
+fn expand_resolve_key(template: &KeyTemplate, krate: &Path, span: Span) -> Option<TokenStream2> {
+    if template.placeholders.len() != 1 || template.specs[0].ends_with(['x', 'X', 'o', 'b', 'e', 'E', '?']) {
+        return None;
+    }
+    let format = LitStr::new(&template.format, span);
+    // Sem texto fixo, qualquer valor "casa" com o template: sempre hidrata.
+    let check = if template.literals.iter().all(String::is_empty) {
+        quote!(false)
+    } else {
+        let literals = template.literals.iter().map(|l| LitStr::new(l, span));
+        quote!(#krate::__private::matches_key_template(&raw, &[#(#literals),*]))
+    };
+    Some(quote! {
+        fn resolve_key(key: impl ::core::fmt::Display) -> ::std::string::String {
+            let raw = ::std::string::ToString::to_string(&key);
+            if raw.is_empty() || #check {
+                raw
+            } else {
+                ::std::format!(#format, key)
+            }
+        }
+    })
+}
+
+/// Template de chave já validado: a string de formato, o caminho e o especificador de cada
+/// `{campo}` e o texto fixo entre eles (`literals.len() == placeholders.len() + 1`).
 #[derive(Debug)]
 struct KeyTemplate {
     format: String,
     placeholders: Vec<Vec<String>>,
+    specs: Vec<String>,
+    literals: Vec<String>,
 }
 
 fn parse_key_template(template: &str) -> Result<KeyTemplate, String> {
     let mut format = String::with_capacity(template.len());
     let mut placeholders = Vec::new();
+    let mut specs = Vec::new();
+    let mut literals = vec![String::new()];
     let mut rest = template;
     while let Some(c) = rest.chars().next() {
         if rest.starts_with("{{") || rest.starts_with("}}") {
             format.push_str(&rest[..2]);
+            literals.last_mut().unwrap().push(c);
             rest = &rest[2..];
         } else if c == '}' {
             return Err("`}` sem `{` correspondente; use `}}` para um `}` literal".into());
@@ -281,16 +325,19 @@ fn parse_key_template(template: &str) -> Result<KeyTemplate, String> {
             }
             format.push('}');
             placeholders.push(segments);
+            specs.push(spec.unwrap_or_default().to_owned());
+            literals.push(String::new());
             rest = &rest[end + 1..];
         } else {
             format.push(c);
+            literals.last_mut().unwrap().push(c);
             rest = &rest[c.len_utf8()..];
         }
     }
     if placeholders.is_empty() {
         return Err("o template da key precisa de pelo menos um `{campo}`".into());
     }
-    Ok(KeyTemplate { format, placeholders })
+    Ok(KeyTemplate { format, placeholders, specs, literals })
 }
 
 /// Identificador (`campo`, `r#type`) ou índice de tupla (`0`).
@@ -434,10 +481,13 @@ mod tests {
         let template = parse_key_template("payments-{business_id}").unwrap();
         assert_eq!(template.format, "payments-{}");
         assert_eq!(template.placeholders, vec![vec!["business_id"]]);
+        assert_eq!(template.literals, vec!["payments-", ""]);
 
         let template = parse_key_template("{tenant}:{ owner.id :05}:{{v1}}").unwrap();
         assert_eq!(template.format, "{}:{:05}:{{v1}}");
         assert_eq!(template.placeholders, vec![vec!["tenant"], vec!["owner", "id"]]);
+        assert_eq!(template.specs, vec!["", "05"]);
+        assert_eq!(template.literals, vec!["", ":", ":{v1}"]);
 
         let template = parse_key_template("pagamento-ção-{r#type}-{pair.0}").unwrap();
         assert_eq!(template.format, "pagamento-ção-{}-{}");

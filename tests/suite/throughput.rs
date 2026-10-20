@@ -40,10 +40,7 @@ async fn run(label: &str, total: u32, keys: Option<u32>, instances: usize, concu
     }
 
     let started = Instant::now();
-    queues[0]
-        .immediate_many((0..total).map(|task_id| BenchJob { task_id, key: keys.map_or(0, |k| task_id % k) }))
-        .await
-        .unwrap();
+    queues[0].immediate_many((0..total).map(|task_id| BenchJob { task_id, key: keys.map_or(0, |k| task_id % k) })).await.unwrap();
     let enqueued = started.elapsed();
     assert!(eventually(Duration::from_secs(120), || done.load(Ordering::Relaxed) == total as usize).await);
     let elapsed = started.elapsed();
@@ -78,10 +75,12 @@ async fn cache_bench(total: u32) {
     let get = started.elapsed();
     assert!(got.iter().all(Option::is_some));
     let started = Instant::now();
-    let tasks: Vec<_> = (0..2000).map(|i| {
-        let cache = cache.clone();
-        tokio::spawn(async move { cache.get::<BenchItem>(i).await.unwrap() })
-    }).collect();
+    let tasks: Vec<_> = (0..2000)
+        .map(|i| {
+            let cache = cache.clone();
+            tokio::spawn(async move { cache.get::<BenchItem>(i).await })
+        })
+        .collect();
     for t in tasks {
         assert!(t.await.unwrap().is_some());
     }

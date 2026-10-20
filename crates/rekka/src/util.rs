@@ -1,8 +1,13 @@
 use std::any::Any;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 
+use futures_util::FutureExt;
 use redis::{RedisError, RetryMethod};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+use tracing::error;
 
 pub(crate) fn millis(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
@@ -14,12 +19,30 @@ pub(crate) fn is_transient(e: &RedisError) -> bool {
 }
 
 pub(crate) fn panic_message(panic: Box<dyn Any + Send>) -> String {
-    if let Some(s) = panic.downcast_ref::<&'static str>() {
-        format!("job panicked: {s}")
-    } else if let Some(s) = panic.downcast_ref::<String>() {
-        format!("job panicked: {s}")
-    } else {
-        "job panicked".to_owned()
+    match panic_text(&panic) {
+        Some(s) => format!("job panicked: {s}"),
+        None => "job panicked".to_owned(),
+    }
+}
+
+fn panic_text(panic: &Box<dyn Any + Send>) -> Option<&str> {
+    panic.downcast_ref::<&'static str>().copied().or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+}
+
+/// Executa um loop interno da lib e o reinicia se ele entrar em pânico (bug), com backoff.
+/// Termina quando o loop retorna normalmente ou quando `token` é cancelado.
+pub(crate) async fn supervise<Fut>(kind: &str, name: &str, token: &CancellationToken, mut start: impl FnMut() -> Fut)
+where
+    Fut: Future<Output = ()>,
+{
+    let mut backoff = Backoff::new();
+    loop {
+        let Err(panic) = AssertUnwindSafe(start()).catch_unwind().await else { return };
+        error!(kind, name, panic = panic_text(&panic).unwrap_or("<non-string panic>"), "rekka: internal task crashed; restarting");
+        tokio::select! {
+            _ = token.cancelled() => return,
+            _ = tokio::time::sleep(backoff.next_delay()) => {}
+        }
     }
 }
 

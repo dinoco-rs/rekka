@@ -52,6 +52,13 @@ async fn invalid_configuration_is_rejected() {
             .await
     ));
     assert!(invalid(env.builder().prefix("bad{prefix}").start().await));
+
+    for expr in ["* * *", "*/0 * * * *", "61 * * * * *", "* * * * mon-xyz", "0 0 30 2 *"] {
+        let res = env.builder().register_recursive("cron", move |w| w.cron_time(expr).build_fn(|| async {})).start().await;
+        assert!(invalid(res), "cron_time {expr:?} should be rejected");
+    }
+    let ok = env.builder().register_recursive("cron", |w| w.cron_time("*/2 * * * *").build_fn(|| async {})).start().await;
+    ok.unwrap().shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

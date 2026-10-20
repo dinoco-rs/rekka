@@ -248,3 +248,31 @@ async fn purge_removes_a_whole_queue() {
     assert!(matches!(q.purge_queue("bad{name").await, Err(RekkaError::InvalidConfig(_))));
     q.shutdown().await.unwrap();
 }
+
+/// O janitor segue o agendamento compartilhado de um worker recorrente: instâncias com as
+/// mesmas filas usam um único agendamento (e um único lock) no Redis.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn janitor_schedule_is_shared_across_instances() {
+    let env = TestEnv::new();
+    let mut instances = Vec::new();
+    for _ in 0..3 {
+        let probe = Probe::new();
+        let gate = Gate { started: Notify::new(), release: Notify::new() };
+        instances.push(
+            env.builder()
+                .data_arc(probe)
+                .data(gate)
+                .cleanup_interval(ms(200))
+                .register::<TidyJob>(|w| w.build_fn(tidy))
+                .start()
+                .await
+                .unwrap(),
+        );
+    }
+    tokio::time::sleep(ms(500)).await;
+    let schedules = env.keys("{rec:__janitor_*}:next").await;
+    assert_eq!(schedules.len(), 1, "{schedules:?}");
+    for q in &instances {
+        q.shutdown().await.unwrap();
+    }
+}

@@ -5,6 +5,7 @@ extern crate self as rekka;
 mod cache;
 mod client;
 mod context;
+mod cron;
 mod error;
 mod event;
 mod handler;
@@ -42,4 +43,21 @@ pub mod __private {
     pub trait CacheBound: serde::Serialize + serde::de::DeserializeOwned + Send + 'static {}
 
     impl<T: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> CacheBound for T {}
+
+    /// Se `key` já é uma chave completa do template: começa com o texto fixo antes do primeiro
+    /// `{campo}`, termina com o texto fixo depois do último, os trechos do meio aparecem em ordem
+    /// e cada `{campo}` ocupa pelo menos um caractere.
+    pub fn matches_key_template(key: &str, literals: &[&str]) -> bool {
+        let [first, middle @ .., last] = literals else { return false };
+        let Some(mut rest) = key.strip_prefix(first) else { return false };
+        for literal in middle {
+            let Some(c) = rest.chars().next() else { return false };
+            let after = &rest[c.len_utf8()..];
+            match after.find(literal) {
+                Some(at) => rest = &after[at + literal.len()..],
+                None => return false,
+            }
+        }
+        rest.len() > last.len() && rest.ends_with(last)
+    }
 }

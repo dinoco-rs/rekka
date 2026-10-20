@@ -55,6 +55,8 @@ async fn main() -> rekka::Result<()> {
         .register_recursive("reconcile_payments", |w| {
             w.interval(Duration::from_secs(60)).build_fn(reconcile_payments)
         })
+        // Expressão cron (formato do node-cron, segundos opcionais): 09:00 de segunda a sexta, UTC.
+        .register_recursive("weekday_report", |w| w.cron_time("0 9 * * mon-fri").build_fn(reconcile_payments))
         .start()
         .await?;
 
@@ -70,7 +72,7 @@ async fn main() -> rekka::Result<()> {
     let businesses = vec![Business { id: 1, name: "Acme".into() }, Business { id: 2, name: "Globex".into() }];
     cache.insert(&businesses[0]).await?;
     cache.insert_many(&businesses).await?;
-    let _one: Option<Business> = cache.get::<Business>(1).await?;
+    let _one: Option<Business> = cache.get::<Business>(1).await;
     let _many: Vec<Option<Business>> = cache.get_many::<Business>([1, 2, 3]).await?;
     cache.remove::<Business>(1).await?;
     cache.remove_many::<Business>([2, 3]).await?;
@@ -107,10 +109,8 @@ async fn execute_mail_job(
     RekkaState(state): RekkaState<MyData>,
     cache: Cache,
 ) -> RekkaExecutionResult {
-    let business = match cache.get::<Business>(job.business_id).await {
-        Ok(business) => business,
-        Err(e) => return handler.err(e),
-    };
+    // `get` nunca falha: ausente, formato incompatível ou Redis fora do ar viram `None`.
+    let business = cache.get::<Business>(job.business_id).await;
     let teste = false;
     if teste {
         return handler.err("falhou"); // entra na regra de retry

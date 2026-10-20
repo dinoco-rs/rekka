@@ -12,7 +12,8 @@ Rekka is a Rust library for Redis-backed job queues and a typed cache, built to 
 │   │   ├── src/
 │   │   │   ├── runtime.rs  QueuesBuilder (configuration, validation, start) and Queues (running handle)
 │   │   │   ├── worker.rs   RekkaWorker options and the queue loop: claim, heartbeat, reaper, finalize
-│   │   │   ├── recursive.rs Recurring workers and reconcile (one instance per cycle via a Redis lock)
+│   │   │   ├── recursive.rs Recurring workers (`interval` or `cron_time`) and reconcile (one instance per cycle via a Redis lock)
+│   │   │   ├── cron.rs     Cron expression parser (node-cron format, optional seconds) and next-occurrence search
 │   │   │   ├── client.rs   RekkaClient (enqueue, remove, state, stats, purge), ReconcileHandler
 │   │   │   ├── job.rs      RekkaQueue, JobHandler, RetryPolicy, RekkaExecutionResult
 │   │   │   ├── handler.rs  JobFn / TaskFn: handlers with up to 8 extractors

@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
+use rekka::chrono::{self, Datelike, FixedOffset, TimeZone, Timelike, Utc};
 use rekka::{EventSource, JobEventKind, JobHandler, Queues, RekkaClient, RekkaQueue, RekkaState};
 use serde::{Deserialize, Serialize};
 
@@ -146,5 +147,119 @@ async fn recursive_workers_use_extractors_and_report_errors() {
             .any(|e| e.job_name() == "failing" && e.kind() == JobEventKind::Failed && e.error() == Some("nope")))
         .await
     );
+    q.shutdown().await.unwrap();
+}
+
+async fn cron_tick(RekkaState(probe): RekkaState<Probe>, RekkaState(instance): RekkaState<Instance>) {
+    let _running = probe.gauge.enter();
+    // Segundo mais próximo: o agendamento segue o relógio do Redis, que pode estar alguns ms
+    // à frente do local (executar às 10:00:02.000 do Redis pode ser 10:00:01.975 aqui).
+    let second = (Utc::now() + chrono::Duration::milliseconds(500)).second();
+    probe.record("cron", 0, i64::from(second), instance.0);
+    tokio::time::sleep(ms(100)).await;
+}
+
+async fn cron_instance(env: &TestEnv, probe: &Arc<Probe>, id: u32, name: &'static str, expr: &'static str) -> Queues {
+    env.builder()
+        .data_arc(probe.clone())
+        .data(Instance(id))
+        .register_recursive(name, move |w| w.cron_time(expr).lease(ms(400)).build_fn(cron_tick))
+        .start()
+        .await
+        .unwrap()
+}
+
+/// `* * * * * *` = todo segundo: com 3 instâncias, uma execução por segundo no total.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cron_time_runs_once_per_occurrence_across_instances() {
+    let env = TestEnv::new();
+    let probe = Probe::new();
+    let mut instances = Vec::new();
+    for id in 1..=3 {
+        instances.push(cron_instance(&env, &probe, id, "every_second", "* * * * * *").await);
+    }
+
+    tokio::time::sleep(ms(3300)).await;
+    for q in &instances {
+        q.shutdown().await.unwrap();
+    }
+    let runs = probe.runs();
+    assert!((2..=4).contains(&runs.len()), "ran {} times in ~3.3s", runs.len());
+    assert_eq!(probe.gauge.max(), 1, "executions overlapped");
+    for pair in runs.windows(2) {
+        let gap = pair[1].at - pair[0].at;
+        assert!(gap >= ms(800), "two runs {gap:?} apart for a one-second cron");
+    }
+}
+
+/// `*/2` no campo de segundos: só segundos pares.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cron_time_steps() {
+    let env = TestEnv::new();
+    let probe = Probe::new();
+    let q = cron_instance(&env, &probe, 1, "even", "*/2 * * * * *").await;
+
+    tokio::time::sleep(ms(4500)).await;
+    q.shutdown().await.unwrap();
+    let runs = probe.runs();
+    assert!((2..=3).contains(&runs.len()), "ran {} times in ~4.5s", runs.len());
+    assert!(runs.iter().all(|r| r.value % 2 == 0), "ran on odd seconds: {:?}", runs.iter().map(|r| r.value).collect::<Vec<_>>());
+}
+
+/// Ao contrário de `interval`, um cron não executa na subida: só agenda o próximo instante.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cron_time_does_not_run_on_start() {
+    let env = TestEnv::new();
+    let probe = Probe::new();
+    let q = cron_instance(&env, &probe, 1, "yearly", "0 0 1 1 *").await;
+
+    tokio::time::sleep(ms(500)).await;
+    q.shutdown().await.unwrap();
+    assert_eq!(probe.count(), 0);
+
+    let mut conn = env.redis().await;
+    let next: i64 = redis::cmd("GET").arg(format!("{}:{{rec:yearly}}:next", env.prefix)).query_async(&mut conn).await.unwrap();
+    let expected = Utc.with_ymd_and_hms(Utc::now().year() + 1, 1, 1, 0, 0, 0).unwrap();
+    assert_eq!(next, expected.timestamp_millis());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cron_time_in_a_timezone() {
+    let env = TestEnv::new();
+    let probe = Probe::new();
+    let sao_paulo = FixedOffset::west_opt(3 * 3600).unwrap();
+    let q = env
+        .builder()
+        .data_arc(probe.clone())
+        .data(Instance(1))
+        .register_recursive("morning", move |w| w.cron_time("0 9 * * *").timezone(sao_paulo).build_fn(cron_tick))
+        .start()
+        .await
+        .unwrap();
+    tokio::time::sleep(ms(300)).await;
+    q.shutdown().await.unwrap();
+
+    let mut conn = env.redis().await;
+    let next: i64 = redis::cmd("GET").arg(format!("{}:{{rec:morning}}:next", env.prefix)).query_async(&mut conn).await.unwrap();
+    let next = Utc.timestamp_millis_opt(next).unwrap().with_timezone(&sao_paulo);
+    assert_eq!((next.hour(), next.minute(), next.second()), (9, 0, 0));
+    assert!(next > Utc::now() && next < Utc::now() + chrono::Duration::days(1));
+}
+
+/// O lock some enquanto a tarefa executa (Redis reiniciado sem persistência, lease estourada
+/// durante uma queda): o heartbeat o retoma, para nenhuma outra instância começar junto.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lost_lock_is_reacquired_while_running() {
+    let env = TestEnv::new();
+    let (probe, events) = (Probe::new(), Events::default());
+    let q = instance(&env, &probe, &events, 1, ms(50), TaskConfig { sleep_ms: 1500, hang_on: 0 }).await;
+    assert!(eventually(Duration::from_secs(2), || probe.count() == 1).await);
+
+    let lock = format!("{}:{{rec:tick}}:lock", env.prefix);
+    let mut conn = env.redis().await;
+    let _: () = redis::cmd("DEL").arg(&lock).query_async(&mut conn).await.unwrap();
+    tokio::time::sleep(ms(250)).await;
+    let pttl: i64 = redis::cmd("PTTL").arg(&lock).query_async(&mut conn).await.unwrap();
+    assert!(pttl > 0, "lock was not re-acquired (pttl {pttl})");
     q.shutdown().await.unwrap();
 }

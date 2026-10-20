@@ -33,8 +33,8 @@ Be part of this journey, help accelerate the development of the Dinoco ecosystem
 - **Typed jobs:** derive `RekkaQueue` on a serde struct. Its `task_id` makes every enqueue an upsert, so a job is never duplicated.
 - **Retries and scheduling:** run now, at an instant, or after a delay. Retry policies, attempt limits, and timeouts are set per queue, and panics are caught.
 - **Safe horizontal scaling:** jobs are leased and heartbeated. If a process dies, its jobs return to the queue, and per-key concurrency holds across every instance.
-- **Recurring workers and reconcile:** interval tasks run on exactly one instance per cycle, and a reconcile hook, scheduled the same way, restores jobs from your own source of truth.
-- **Typed cache:** derive `RekkaCache` with a TTL and a key, either a field or a template such as `"payments-{business_id}"`, then read and write single items or batches.
+- **Recurring workers and reconcile:** tasks run on an interval or a cron expression (`cron_time("*/2 * * * *")`, with optional seconds), on exactly one instance per cycle, and a reconcile hook, scheduled the same way, restores jobs from your own source of truth.
+- **Typed cache:** derive `RekkaCache` with a TTL and a key, either a field or a template such as `"session:{session_id}"`, then `cache.get::<Session>(42)` with just the field value. Reads never fail: a miss or an unreachable Redis is `None`.
 - **Graceful shutdown and events:** stop taking work on SIGINT/SIGTERM, wait for running jobs, and observe every job through one event hook.
 
 ## 📦 Installation
@@ -43,7 +43,7 @@ Add Rekka to your `Cargo.toml` dependencies:
 
 ```toml
 [dependencies]
-rekka = "0.0.1"
+rekka = "0.0.2"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -83,11 +83,7 @@ async fn send_email(
     RekkaState(mailer): RekkaState<Mailer>,
     cache: Cache,
 ) -> RekkaExecutionResult {
-    let user = match cache.get::<User>(job.user_id).await {
-        Ok(user) => user,
-        Err(error) => return handler.err(error),
-    };
-    let Some(user) = user else {
+    let Some(user) = cache.get::<User>(job.user_id).await else {
         return handler.cancel();
     };
 
@@ -141,9 +137,6 @@ REKKA_REDIS_URL=redis://127.0.0.1:6379 cargo test
 
 ## 📄 License
 
-Licensed under either of
+This project is licensed under the Apache License 2.0.
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](https://github.com/dinoco-rs/rekka/blob/master/LICENSE-APACHE))
-- MIT license ([LICENSE-MIT](https://github.com/dinoco-rs/rekka/blob/master/LICENSE-MIT))
-
-at your option.
+See [LICENSE](https://github.com/dinoco-rs/rekka/blob/master/LICENSE) for details.
