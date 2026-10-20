@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rekka::{JobEventKind, JobHandler, JobState, RekkaError, RekkaQueue, RekkaState};
+use rekka::{JobEventKind, JobHandler, JobState, RekkaError, RekkaQueue, RekkaData};
 use serde::{Deserialize, Serialize};
 
 use crate::common::{Events, Instance, Probe, TestEnv, eventually, ms};
@@ -15,7 +15,7 @@ struct SlowJob {
     hang_on: u32,
 }
 
-async fn slow(h: JobHandler, job: SlowJob, RekkaState(probe): RekkaState<Probe>, RekkaState(instance): RekkaState<Instance>) {
+async fn slow(h: JobHandler, job: SlowJob, RekkaData(probe): RekkaData<Probe>, RekkaData(instance): RekkaData<Instance>) {
     probe.record(h.task_id(), h.attempt(), 0, instance.0);
     if instance.0 == job.hang_on {
         std::future::pending::<()>().await;

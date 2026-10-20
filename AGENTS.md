@@ -17,7 +17,7 @@ Rekka is a Rust library for Redis-backed job queues and a typed cache, built to 
 │   │   │   ├── client.rs   RekkaClient (enqueue, remove, state, stats, purge), ReconcileHandler
 │   │   │   ├── job.rs      RekkaQueue, JobHandler, RetryPolicy, RekkaExecutionResult
 │   │   │   ├── handler.rs  JobFn / TaskFn: handlers with up to 8 extractors
-│   │   │   ├── context.rs  FromContext, RekkaContext, RekkaState
+│   │   │   ├── context.rs  FromContext, RekkaContext, RekkaData
 │   │   │   ├── cache.rs    Cache, CacheBuilder, RekkaCache
 │   │   │   ├── event.rs    JobEvent, JobEventKind, EventSource
 │   │   │   ├── scripts.rs  Every Lua script plus the Redis data model of a queue (read its header)

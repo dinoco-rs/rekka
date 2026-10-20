@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use rekka::{JobHandler, Queues, RekkaError, RekkaQueue, RekkaState};
+use rekka::{JobHandler, Queues, RekkaError, RekkaQueue, RekkaData};
 use serde::{Deserialize, Serialize};
 
 use crate::common::TestEnv;
@@ -13,11 +13,11 @@ struct CfgJob {
 
 struct NotRegistered;
 
-async fn needs_data(_h: JobHandler, _job: CfgJob, _state: RekkaState<NotRegistered>) {}
+async fn needs_data(_h: JobHandler, _job: CfgJob, _state: RekkaData<NotRegistered>) {}
 
 async fn noop(_h: JobHandler, _job: CfgJob) {}
 
-async fn task_needs_data(_state: RekkaState<NotRegistered>) {}
+async fn task_needs_data(_state: RekkaData<NotRegistered>) {}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn missing_data_fails_at_start() {

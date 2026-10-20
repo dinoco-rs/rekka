@@ -58,17 +58,17 @@ pub trait FromContext: Sized + Send + 'static {
 /// Acesso ao dado registrado com `.data(value)`.
 ///
 /// ```ignore
-/// async fn handler(h: JobHandler, job: MailJob, RekkaState(db): RekkaState<Db>) { ... }
+/// async fn handler(h: JobHandler, job: MailJob, RekkaData(db): RekkaData<Db>) { ... }
 /// ```
-pub struct RekkaState<T>(pub Arc<T>);
+pub struct RekkaData<T>(pub Arc<T>);
 
-impl<T> Clone for RekkaState<T> {
+impl<T> Clone for RekkaData<T> {
     fn clone(&self) -> Self {
         Self(Arc::clone(&self.0))
     }
 }
 
-impl<T> Deref for RekkaState<T> {
+impl<T> Deref for RekkaData<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
@@ -76,10 +76,10 @@ impl<T> Deref for RekkaState<T> {
     }
 }
 
-impl<T: Send + Sync + 'static> FromContext for RekkaState<T> {
+impl<T: Send + Sync + 'static> FromContext for RekkaData<T> {
     #[inline]
     fn from_context(cx: &RekkaContext) -> Result<Self> {
-        cx.data::<T>().map(RekkaState).ok_or(RekkaError::MissingData(type_name::<T>()))
+        cx.data::<T>().map(RekkaData).ok_or(RekkaError::MissingData(type_name::<T>()))
     }
 
     fn validate(cx: &RekkaContext) -> Result<()> {

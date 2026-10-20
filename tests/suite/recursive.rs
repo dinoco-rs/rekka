@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use rekka::chrono::{self, Datelike, FixedOffset, TimeZone, Timelike, Utc};
-use rekka::{EventSource, JobEventKind, JobHandler, Queues, RekkaClient, RekkaQueue, RekkaState};
+use rekka::{EventSource, JobEventKind, JobHandler, Queues, RekkaClient, RekkaQueue, RekkaData};
 use serde::{Deserialize, Serialize};
 
 use crate::common::{Events, Instance, Probe, TestEnv, eventually, ms};
@@ -14,7 +14,7 @@ struct TaskConfig {
     hang_on: u32,
 }
 
-async fn tick(RekkaState(probe): RekkaState<Probe>, RekkaState(instance): RekkaState<Instance>, RekkaState(cfg): RekkaState<TaskConfig>) {
+async fn tick(RekkaData(probe): RekkaData<Probe>, RekkaData(instance): RekkaData<Instance>, RekkaData(cfg): RekkaData<TaskConfig>) {
     let _running = probe.gauge.enter();
     probe.record("tick", 0, 0, instance.0);
     if instance.0 == cfg.hang_on {
@@ -109,13 +109,13 @@ struct ReportJob {
     task_id: u32,
 }
 
-async fn enqueue_report(client: RekkaClient, RekkaState(counter): RekkaState<AtomicU32>) -> rekka::Result<()> {
+async fn enqueue_report(client: RekkaClient, RekkaData(counter): RekkaData<AtomicU32>) -> rekka::Result<()> {
     let n = counter.fetch_add(1, Ordering::SeqCst);
     client.immediate(ReportJob { task_id: n }).await?;
     Ok(())
 }
 
-async fn report(h: JobHandler, _job: ReportJob, RekkaState(probe): RekkaState<Probe>) {
+async fn report(h: JobHandler, _job: ReportJob, RekkaData(probe): RekkaData<Probe>) {
     probe.record(h.task_id(), h.attempt(), 0, 0);
 }
 
@@ -150,7 +150,7 @@ async fn recursive_workers_use_extractors_and_report_errors() {
     q.shutdown().await.unwrap();
 }
 
-async fn cron_tick(RekkaState(probe): RekkaState<Probe>, RekkaState(instance): RekkaState<Instance>) {
+async fn cron_tick(RekkaData(probe): RekkaData<Probe>, RekkaData(instance): RekkaData<Instance>) {
     let _running = probe.gauge.enter();
     // Segundo mais próximo: o agendamento segue o relógio do Redis, que pode estar alguns ms
     // à frente do local (executar às 10:00:02.000 do Redis pode ser 10:00:01.975 aqui).

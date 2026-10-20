@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rekka::{JobEventKind, JobHandler, Queues, RekkaQueue, RekkaState};
+use rekka::{JobEventKind, JobHandler, Queues, RekkaQueue, RekkaData};
 use serde::{Deserialize, Serialize};
 
 use crate::common::{Events, Instance, Probe, TestEnv, eventually, ms};
@@ -18,8 +18,8 @@ struct FragileJob {
 async fn fragile(
     h: JobHandler,
     job: FragileJob,
-    RekkaState(probe): RekkaState<Probe>,
-    RekkaState(instance): RekkaState<Instance>,
+    RekkaData(probe): RekkaData<Probe>,
+    RekkaData(instance): RekkaData<Instance>,
 ) {
     probe.record(h.task_id(), h.attempt(), 0, instance.0);
     if instance.0 == job.hang_on {
@@ -113,7 +113,7 @@ struct MixedJob {
     sleep_ms: u64,
 }
 
-async fn mixed(h: JobHandler, job: MixedJob, RekkaState(probe): RekkaState<Probe>) {
+async fn mixed(h: JobHandler, job: MixedJob, RekkaData(probe): RekkaData<Probe>) {
     if job.sleep_ms > 0 {
         probe.record(h.task_id(), h.attempt(), 0, 0);
         tokio::time::sleep(ms(job.sleep_ms)).await;

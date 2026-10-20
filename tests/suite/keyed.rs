@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rekka::{JobHandler, JobState, Queues, RekkaQueue, RekkaState, RetryPolicy};
+use rekka::{JobHandler, JobState, Queues, RekkaQueue, RekkaData, RetryPolicy};
 use serde::{Deserialize, Serialize};
 
 use crate::common::{Instance, Probe, TestEnv, eventually, eventually_async, ms};
@@ -23,8 +23,8 @@ fn mail(id: &str, business_id: i64, sleep_ms: u64) -> MailJob {
 async fn send(
     h: JobHandler,
     job: MailJob,
-    RekkaState(probe): RekkaState<Probe>,
-    RekkaState(instance): RekkaState<Instance>,
+    RekkaData(probe): RekkaData<Probe>,
+    RekkaData(instance): RekkaData<Instance>,
 ) -> Result<(), String> {
     let _total = probe.gauge.enter();
     let _key = probe.keys.enter(job.business_id.to_string());

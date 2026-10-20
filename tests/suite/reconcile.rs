@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rekka::{Enqueued, EventSource, JobEventKind, JobHandler, Queues, ReconcileHandler, RekkaQueue, RekkaState};
+use rekka::{Enqueued, EventSource, JobEventKind, JobHandler, Queues, ReconcileHandler, RekkaQueue, RekkaData};
 use serde::{Deserialize, Serialize};
 
 use crate::common::{Events, Probe, TestEnv, eventually, eventually_async, ms};
@@ -28,7 +28,7 @@ impl Db {
     }
 }
 
-async fn reconcile(handler: ReconcileHandler, RekkaState(db): RekkaState<Db>) -> rekka::Result<()> {
+async fn reconcile(handler: ReconcileHandler, RekkaData(db): RekkaData<Db>) -> rekka::Result<()> {
     db.runs.fetch_add(1, Ordering::SeqCst);
     let pending = db.pending.lock().unwrap().clone();
     for job in pending {
@@ -38,7 +38,7 @@ async fn reconcile(handler: ReconcileHandler, RekkaState(db): RekkaState<Db>) ->
     Ok(())
 }
 
-async fn process(h: JobHandler, job: InvoiceJob, RekkaState(probe): RekkaState<Probe>) {
+async fn process(h: JobHandler, job: InvoiceJob, RekkaData(probe): RekkaData<Probe>) {
     probe.record(h.task_id(), h.attempt(), 0, 0);
     tokio::time::sleep(ms(job.sleep_ms)).await;
 }
@@ -169,7 +169,7 @@ async fn startup_reconcile_runs_once_across_instances() {
     restarted.shutdown().await.unwrap();
 }
 
-async fn add_many_reconcile(handler: ReconcileHandler, RekkaState(count): RekkaState<AtomicUsize>) -> rekka::Result<()> {
+async fn add_many_reconcile(handler: ReconcileHandler, RekkaData(count): RekkaData<AtomicUsize>) -> rekka::Result<()> {
     let created = handler.add_many((0..500).map(|i| invoice(&format!("bulk{i}"), 0))).await?;
     count.fetch_add(created, Ordering::SeqCst);
     Ok(())

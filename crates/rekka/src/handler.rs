@@ -6,7 +6,7 @@ use crate::error::Result;
 use crate::job::{IntoExecutionResult, JobHandler, RekkaQueue};
 
 /// Handler de job: `async fn(JobHandler, J, E1, ..., En) -> impl IntoExecutionResult`,
-/// onde cada `Ei` implementa [`FromContext`] (ex.: `RekkaState<T>`, `RekkaClient`).
+/// onde cada `Ei` implementa [`FromContext`] (ex.: `RekkaData<T>`, `RekkaClient`).
 ///
 /// O future do handler não é boxeado: cada job vira uma única task tokio.
 pub trait JobFn<J, M>: Send + Sync + 'static {

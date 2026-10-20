@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use rekka::{JobEventKind, JobHandler, RekkaQueue, RekkaState, RekkaWorker, RetryPolicy};
+use rekka::{JobEventKind, JobHandler, RekkaQueue, RekkaData, RekkaWorker, RetryPolicy};
 use serde::{Deserialize, Serialize};
 
 use crate::common::{Events, Probe, TestEnv, eventually, ms};
@@ -21,8 +21,8 @@ struct LastAttemptSeen(AtomicBool);
 async fn flaky(
     h: JobHandler,
     job: FlakyJob,
-    RekkaState(probe): RekkaState<Probe>,
-    RekkaState(seen): RekkaState<LastAttemptSeen>,
+    RekkaData(probe): RekkaData<Probe>,
+    RekkaData(seen): RekkaData<LastAttemptSeen>,
 ) -> Result<(), String> {
     probe.record(h.task_id(), h.attempt(), i64::from(h.is_last_attempt()), 0);
     if h.is_last_attempt() {

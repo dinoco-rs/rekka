@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rekka::chrono::Utc;
-use rekka::{Enqueued, JobEventKind, JobHandler, JobState, RekkaError, RekkaQueue, RekkaState, Removed};
+use rekka::{Enqueued, JobEventKind, JobHandler, JobState, RekkaError, RekkaQueue, RekkaData, Removed};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
@@ -19,7 +19,7 @@ fn mail(id: &str, value: i64) -> MailJob {
     MailJob { task_id: id.into(), value }
 }
 
-async fn record(h: JobHandler, job: MailJob, RekkaState(probe): RekkaState<Probe>) {
+async fn record(h: JobHandler, job: MailJob, RekkaData(probe): RekkaData<Probe>) {
     probe.record(h.task_id(), h.attempt(), job.value, 0);
 }
 
@@ -139,7 +139,7 @@ struct Gate {
     release: Notify,
 }
 
-async fn gated(h: JobHandler, job: MailJob, RekkaState(probe): RekkaState<Probe>, RekkaState(gate): RekkaState<Gate>) {
+async fn gated(h: JobHandler, job: MailJob, RekkaData(probe): RekkaData<Probe>, RekkaData(gate): RekkaData<Gate>) {
     let _running = probe.gauge.enter();
     probe.record(h.task_id(), h.attempt(), job.value, 0);
     if job.value == 1 {
@@ -181,7 +181,7 @@ async fn enqueue_while_running_runs_after_current_and_never_in_parallel() {
     q.shutdown().await.unwrap();
 }
 
-async fn fail_slowly(h: JobHandler, job: MailJob, RekkaState(probe): RekkaState<Probe>, RekkaState(gate): RekkaState<Gate>) -> Result<(), String> {
+async fn fail_slowly(h: JobHandler, job: MailJob, RekkaData(probe): RekkaData<Probe>, RekkaData(gate): RekkaData<Gate>) -> Result<(), String> {
     probe.record(h.task_id(), h.attempt(), job.value, 0);
     gate.started.notify_one();
     gate.release.notified().await;

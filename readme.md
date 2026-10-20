@@ -43,7 +43,7 @@ Add Rekka to your `Cargo.toml` dependencies:
 
 ```toml
 [dependencies]
-rekka = "0.0.2"
+rekka = "0.0.3"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -55,7 +55,7 @@ Rekka requires Rust 1.88 or newer and a Redis 6+ server.
 ```rust
 use std::time::Duration;
 
-use rekka::{Cache, JobHandler, Queues, RekkaCache, RekkaExecutionResult, RekkaQueue, RekkaState, RetryPolicy};
+use rekka::{Cache, JobHandler, Queues, RekkaCache, RekkaExecutionResult, RekkaQueue, RekkaData, RetryPolicy};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, RekkaQueue)]
@@ -80,7 +80,7 @@ struct Mailer {
 async fn send_email(
     handler: JobHandler,
     job: SendEmail,
-    RekkaState(mailer): RekkaState<Mailer>,
+    RekkaData(mailer): RekkaData<Mailer>,
     cache: Cache,
 ) -> RekkaExecutionResult {
     let Some(user) = cache.get::<User>(job.user_id).await else {

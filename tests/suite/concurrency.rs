@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rekka::{JobHandler, Queues, RekkaQueue, RekkaState};
+use rekka::{JobHandler, Queues, RekkaQueue, RekkaData};
 use serde::{Deserialize, Serialize};
 
 use crate::common::{Instance, Probe, TestEnv, eventually, ms};
@@ -14,7 +14,7 @@ struct WorkJob {
     sleep_ms: u64,
 }
 
-async fn work(h: JobHandler, job: WorkJob, RekkaState(probe): RekkaState<Probe>, RekkaState(instance): RekkaState<Instance>) {
+async fn work(h: JobHandler, job: WorkJob, RekkaData(probe): RekkaData<Probe>, RekkaData(instance): RekkaData<Instance>) {
     let _running = probe.gauge.enter();
     probe.record(h.task_id(), h.attempt(), 0, instance.0);
     tokio::time::sleep(ms(job.sleep_ms)).await;

@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rekka::chrono::Utc;
-use rekka::{JobHandler, RekkaError, RekkaExecutionResult, RekkaQueue, RekkaState, RetryPolicy};
+use rekka::{JobHandler, RekkaError, RekkaExecutionResult, RekkaQueue, RekkaData, RetryPolicy};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
@@ -25,7 +25,7 @@ struct Gate {
     release: Notify,
 }
 
-async fn tidy(h: JobHandler, job: TidyJob, RekkaState(probe): RekkaState<Probe>, RekkaState(gate): RekkaState<Gate>) -> RekkaExecutionResult {
+async fn tidy(h: JobHandler, job: TidyJob, RekkaData(probe): RekkaData<Probe>, RekkaData(gate): RekkaData<Gate>) -> RekkaExecutionResult {
     probe.record(h.task_id(), h.attempt(), 0, 0);
     match job.mode.as_str() {
         "cancel" => h.cancel(),
@@ -99,7 +99,7 @@ struct FixJob {
     key: u32,
 }
 
-async fn fix(h: JobHandler, _job: FixJob, RekkaState(probe): RekkaState<Probe>) {
+async fn fix(h: JobHandler, _job: FixJob, RekkaData(probe): RekkaData<Probe>) {
     probe.record(h.task_id(), h.attempt(), 0, 0);
 }
 
@@ -202,7 +202,7 @@ struct LegacyJob {
     task_id: u32,
 }
 
-async fn hold(h: JobHandler, job: TidyJob, RekkaState(probe): RekkaState<Probe>, RekkaState(gate): RekkaState<Gate>) {
+async fn hold(h: JobHandler, job: TidyJob, RekkaData(probe): RekkaData<Probe>, RekkaData(gate): RekkaData<Gate>) {
     probe.record(h.task_id(), h.attempt(), 0, 0);
     if job.mode == "gate" {
         gate.started.notify_one();

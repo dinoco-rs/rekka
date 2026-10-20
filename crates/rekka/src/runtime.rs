@@ -55,7 +55,7 @@ impl QueuesBuilder {
         self
     }
 
-    /// Disponibiliza `value` para todos os handlers via `RekkaState<T>`. Pode ser chamado
+    /// Disponibiliza `value` para todos os handlers via `RekkaData<T>`. Pode ser chamado
     /// várias vezes com tipos diferentes.
     pub fn data<T: Send + Sync + 'static>(self, value: T) -> Self {
         self.data_arc(Arc::new(value))

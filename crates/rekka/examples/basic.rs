@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use rekka::chrono::Utc;
 use rekka::{
-    Cache, JobEvent, JobHandler, Queues, ReconcileHandler, RekkaCache, RekkaExecutionResult, RekkaQueue, RekkaState,
+    Cache, JobEvent, JobHandler, Queues, ReconcileHandler, RekkaCache, RekkaExecutionResult, RekkaQueue, RekkaData,
     RetryPolicy,
 };
 use serde::{Deserialize, Serialize};
@@ -106,7 +106,7 @@ async fn reconcile_function(handler: ReconcileHandler) -> rekka::Result<()> {
 async fn execute_mail_job(
     handler: JobHandler,
     job: MailJob,
-    RekkaState(state): RekkaState<MyData>,
+    RekkaData(state): RekkaData<MyData>,
     cache: Cache,
 ) -> RekkaExecutionResult {
     // `get` nunca falha: ausente, formato incompatível ou Redis fora do ar viram `None`.
@@ -130,4 +130,4 @@ async fn execute_other_job(_handler: JobHandler, _job: OtherJob) -> Result<(), s
     Ok(())
 }
 
-async fn reconcile_payments(RekkaState(_state): RekkaState<MyData>) {}
+async fn reconcile_payments(RekkaData(_state): RekkaData<MyData>) {}

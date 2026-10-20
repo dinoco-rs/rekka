@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use rekka::{EventSource, JobEvent, JobEventKind, JobHandler, RekkaQueue, RekkaState};
+use rekka::{EventSource, JobEvent, JobEventKind, JobHandler, RekkaQueue, RekkaData};
 use serde::{Deserialize, Serialize};
 
 use crate::common::{Events, Probe, TestEnv, eventually};
@@ -20,7 +20,7 @@ struct OtherJob {
     task_id: String,
 }
 
-async fn send(h: JobHandler, _job: MailJob, RekkaState(probe): RekkaState<Probe>) {
+async fn send(h: JobHandler, _job: MailJob, RekkaData(probe): RekkaData<Probe>) {
     probe.record(h.task_id(), h.attempt(), 0, 0);
 }
 

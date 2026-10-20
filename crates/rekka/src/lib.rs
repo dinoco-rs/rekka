@@ -20,7 +20,7 @@ mod worker;
 
 pub use cache::{Cache, CacheBuilder, RekkaCache};
 pub use client::{Enqueued, JobState, QueueStats, ReconcileHandler, RekkaClient, Removed};
-pub use context::{FromContext, RekkaContext, RekkaState};
+pub use context::{FromContext, RekkaContext, RekkaData};
 pub use error::{RekkaError, Result};
 pub use event::{EventSource, JobEvent, JobEventKind};
 pub use handler::{IntoTaskResult, JobFn, TaskFn};

@@ -8,7 +8,7 @@ pub enum RekkaError {
     Redis(redis::RedisError),
     /// Falha ao serializar ou desserializar um job.
     Serialization(serde_json::Error),
-    /// Um extractor `RekkaState<T>` foi usado sem registrar `T` com `.data(...)`.
+    /// Um extractor `RekkaData<T>` foi usado sem registrar `T` com `.data(...)`.
     MissingData(&'static str),
     /// Configuração inválida (nome duplicado, valores fora do intervalo, etc).
     InvalidConfig(String),

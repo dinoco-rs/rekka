@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use rekka::{JobHandler, RekkaCache, RekkaQueue, RekkaState};
+use rekka::{JobHandler, RekkaCache, RekkaQueue, RekkaData};
 use serde::{Deserialize, Serialize};
 
 use crate::common::{TestEnv, eventually};
@@ -17,7 +17,7 @@ struct BenchJob {
     key: u32,
 }
 
-async fn noop(_h: JobHandler, _job: BenchJob, RekkaState(done): RekkaState<AtomicUsize>) {
+async fn noop(_h: JobHandler, _job: BenchJob, RekkaData(done): RekkaData<AtomicUsize>) {
     done.fetch_add(1, Ordering::Relaxed);
 }
 
