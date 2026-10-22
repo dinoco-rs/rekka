@@ -2,8 +2,10 @@
 
 extern crate self as rekka;
 
+mod buffer;
 mod cache;
 mod client;
+mod conn;
 mod context;
 mod cron;
 mod error;

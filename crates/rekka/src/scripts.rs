@@ -448,38 +448,63 @@ return fixed
 ";
 
 const RECURSIVE_PRELUDE: &str = r"
-local NEXT, LOCK = KEYS[1], KEYS[2]
+local NEXT, LOCK, RECOVERY = KEYS[1], KEYS[2], KEYS[3]
 local T = redis.call('TIME')
 local NOW = tonumber(T[1]) * 1000 + math.floor(tonumber(T[2]) / 1000)
 ";
 
-/// ARGV: token, interval_ms, lease_ms. Retorna `{1, interval}` (executar) ou `{0, espera_ms}`.
+/// ARGV: token, interval_ms, lease_ms, window_ms. Retorna `{1, interval}` (executar) ou
+/// `{0, espera_ms}`. Com `window_ms > 0` (reconcile), uma execução devida por uma reconexão
+/// (`REC_RECOVER`) roda antes do horário; ao ser consumida, a marca vira `0` por `window_ms`,
+/// para as outras instâncias que perceberam a mesma queda não rodarem de novo.
 const REC_CLAIM: &str = r"
+local window = tonumber(ARGV[4])
+local owed = window > 0 and redis.call('GET', RECOVERY) == '1'
 local nx = tonumber(redis.call('GET', NEXT) or '0')
 local pttl = redis.call('PTTL', LOCK)
 if pttl ~= -2 then
   local w = nx - NOW
-  if w <= 0 then w = (pttl > 0) and pttl or 1000 end
+  if owed or w <= 0 then w = (pttl > 0) and pttl or 1000 end
   return {0, w}
 end
-if nx > NOW then return {0, nx - NOW} end
+if nx > NOW and not owed then return {0, nx - NOW} end
 local interval = tonumber(ARGV[2])
 local lease = tonumber(ARGV[3])
 redis.call('SET', LOCK, ARGV[1], 'PX', lease)
 redis.call('SET', NEXT, NOW + interval, 'PX', interval * 2 + lease)
+if owed then redis.call('SET', RECOVERY, '0', 'PX', window) end
 return {1, interval}
 ";
 
-/// ARGV: token, lease_ms. Retorna 1 = renovado, 2 = tinha expirado e foi retomado,
-/// 0 = outra instância detém o lock.
+/// O Redis voltou depois de uma queda: marca uma execução devida, a menos que já exista uma
+/// marca (devida, ou `0` de uma execução já feita por esta queda). ARGV: keep_ms. Retorna 1 se marcou.
+const REC_RECOVER: &str = r"
+if redis.call('EXISTS', RECOVERY) == 1 then return 0 end
+redis.call('SET', RECOVERY, '1', 'PX', ARGV[1])
+return 1
+";
+
+/// ARGV: token, lease_ms, delay_ms. Retorna 1 = renovado, 2 = tinha expirado e foi retomado,
+/// 0 = outra instância detém o lock. Com `delay_ms > 0`, mantém a próxima execução pelo menos
+/// `delay_ms` à frente enquanto esta executa: se o lock se perder (Redis fora por mais que a
+/// lease), nenhuma outra instância começa antes de `delay_ms` depois do último sinal de vida.
 const REC_EXTEND: &str = r"
 local cur = redis.call('GET', LOCK)
-if cur == ARGV[1] then return redis.call('PEXPIRE', LOCK, ARGV[2]) end
-if not cur then
+local res = 0
+if cur == ARGV[1] then
+  redis.call('PEXPIRE', LOCK, ARGV[2])
+  res = 1
+elseif not cur then
   redis.call('SET', LOCK, ARGV[1], 'PX', ARGV[2])
-  return 2
+  res = 2
+else
+  return 0
 end
-return 0
+local delay = tonumber(ARGV[3])
+if delay > 0 and NOW + delay > tonumber(redis.call('GET', NEXT) or '0') then
+  redis.call('SET', NEXT, NOW + delay, 'PX', delay * 2 + tonumber(ARGV[2]))
+end
+return res
 ";
 
 /// Retorna `{próxima_execução_ms (-1 = sem agendamento), agora_ms, pttl_do_lock (-2 = livre)}`.
@@ -509,9 +534,15 @@ redis.call('SET', NEXT, nxt, 'PX', keep)
 return 1
 ";
 
-/// ARGV: token
+/// ARGV: token, delay_ms, lease_ms. Com `delay_ms > 0`, agenda a próxima execução para
+/// `agora + delay_ms`, exceto se outra instância detém o lock (ela agenda ao terminar).
 const REC_RELEASE: &str = r"
-if redis.call('GET', LOCK) == ARGV[1] then redis.call('DEL', LOCK) end
+local cur = redis.call('GET', LOCK)
+if cur == ARGV[1] then redis.call('DEL', LOCK) end
+local delay = tonumber(ARGV[2])
+if delay > 0 and (cur == ARGV[1] or not cur) then
+  redis.call('SET', NEXT, NOW + delay, 'PX', delay * 2 + tonumber(ARGV[3]))
+end
 return 1
 ";
 
@@ -553,9 +584,10 @@ pub(crate) static REC_RELEASE_SCRIPT: LazyLock<Script> = LazyLock::new(|| recurs
 pub(crate) static REC_BUMP_SCRIPT: LazyLock<Script> = LazyLock::new(|| recursive_script(REC_BUMP));
 pub(crate) static REC_PEEK_SCRIPT: LazyLock<Script> = LazyLock::new(|| recursive_script(REC_PEEK));
 pub(crate) static REC_CRON_CLAIM_SCRIPT: LazyLock<Script> = LazyLock::new(|| recursive_script(REC_CRON_CLAIM));
+pub(crate) static REC_RECOVER_SCRIPT: LazyLock<Script> = LazyLock::new(|| recursive_script(REC_RECOVER));
 
 /// Todos os scripts, carregados no `start()` para falhar cedo.
-pub(crate) fn all() -> [&'static Script; 19] {
+pub(crate) fn all() -> [&'static Script; 20] {
     [
         &CLAIM_SCRIPT,
         &BIND_SCRIPT,
@@ -576,5 +608,6 @@ pub(crate) fn all() -> [&'static Script; 19] {
         &REC_BUMP_SCRIPT,
         &REC_PEEK_SCRIPT,
         &REC_CRON_CLAIM_SCRIPT,
+        &REC_RECOVER_SCRIPT,
     ]
 }

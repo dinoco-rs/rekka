@@ -2,11 +2,11 @@ use std::fmt::Display;
 use std::sync::Arc;
 use std::time::Duration;
 
-use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tracing::warn;
 
+use crate::conn::RedisConn;
 use crate::context::{FromContext, RekkaContext};
 use crate::error::{RekkaError, Result};
 use crate::util::{delete_matching, glob_escape, millis};
@@ -34,7 +34,7 @@ pub trait RekkaCache: Serialize + DeserializeOwned + Send + 'static {
 /// Cache tipado sobre Redis. Clonável e barato; também é um extractor dentro dos handlers.
 #[derive(Clone)]
 pub struct Cache {
-    conn: ConnectionManager,
+    conn: RedisConn,
     prefix: Arc<str>,
 }
 
@@ -68,11 +68,7 @@ impl CacheBuilder {
             return Err(RekkaError::InvalidConfig("prefix must not be empty".into()));
         }
         let client = redis::Client::open(self.url.as_str())?;
-        let config = ConnectionManagerConfig::new()
-            .set_connection_timeout(Some(self.connection_timeout))
-            .set_response_timeout(Some(self.response_timeout))
-            .set_max_delay(Duration::from_secs(2));
-        let conn = client.get_connection_manager_with_config(config).await?;
+        let conn = RedisConn::connect(client, self.connection_timeout, self.response_timeout).await?;
         Ok(Cache { conn, prefix: self.prefix.into() })
     }
 }
@@ -92,7 +88,7 @@ impl Cache {
         }
     }
 
-    pub(crate) fn from_parts(conn: ConnectionManager, prefix: Arc<str>) -> Self {
+    pub(crate) fn from_parts(conn: RedisConn, prefix: Arc<str>) -> Self {
         Self { conn, prefix }
     }
 

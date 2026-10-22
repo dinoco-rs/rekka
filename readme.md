@@ -33,8 +33,9 @@ Be part of this journey, help accelerate the development of the Dinoco ecosystem
 - **Typed jobs:** derive `RekkaQueue` on a serde struct. Its `task_id` makes every enqueue an upsert, so a job is never duplicated.
 - **Retries and scheduling:** run now, at an instant, or after a delay. Retry policies, attempt limits, and timeouts are set per queue, and panics are caught.
 - **Safe horizontal scaling:** jobs are leased and heartbeated. If a process dies, its jobs return to the queue, and per-key concurrency holds across every instance.
-- **Recurring workers and reconcile:** tasks run on an interval or a cron expression (`cron_time("*/2 * * * *")`, with optional seconds), on exactly one instance per cycle, and a reconcile hook, scheduled the same way, restores jobs from your own source of truth.
+- **Recurring workers and reconcile:** tasks run on an interval or a cron expression (`cron_time("*/2 * * * *")`, with optional seconds), on exactly one instance per cycle, and a reconcile hook on the same shared schedule restores jobs from your own source of truth, starting its next run only after the previous one ends.
 - **Typed cache:** derive `RekkaCache` with a TTL and a key, either a field or a template such as `"session:{session_id}"`, then `cache.get::<Session>(42)` with just the field value. Reads never fail: a miss or an unreachable Redis is `None`.
+- **Survives Redis outages:** while Redis is down, enqueued jobs are kept in a local file and sent, in order, once it returns, and no call hangs. Queues, recurring workers, and the cache resume on their own, and reconcile runs once as soon as Redis is back, even after a failover or a restart that lost the data.
 - **Graceful shutdown and events:** stop taking work on SIGINT/SIGTERM, wait for running jobs, and observe every job through one event hook.
 
 ## 📦 Installation
@@ -43,12 +44,12 @@ Add Rekka to your `Cargo.toml` dependencies:
 
 ```toml
 [dependencies]
-rekka = "0.0.3"
+rekka = "0.0.4"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-Rekka requires Rust 1.88 or newer and a Redis 6+ server.
+Rekka requires Rust 1.89 or newer and a Redis 6+ server.
 
 ## ⚡ Quick example
 

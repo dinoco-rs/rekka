@@ -3,10 +3,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
-use redis::aio::ConnectionManager;
+use chrono::{DateTime, TimeDelta, Utc};
+use tracing::warn;
 
+use crate::buffer::{Buffer, Entry};
 use crate::cache::Cache;
+use crate::conn::RedisConn;
 use crate::context::DataMap;
 use crate::error::{RekkaError, Result};
 use crate::event::{EventHandler, JobEvent};
@@ -18,16 +20,18 @@ use crate::util::millis;
 pub(crate) type KeyFn<J> = Arc<dyn Fn(&J) -> String + Send + Sync>;
 
 /// Máximo de jobs por chamada de script em operações em lote.
-const ENQUEUE_CHUNK: usize = 256;
+pub(crate) const ENQUEUE_CHUNK: usize = 256;
 
 pub(crate) struct Shared {
-    pub(crate) conn: ConnectionManager,
+    pub(crate) conn: RedisConn,
     pub(crate) prefix: Arc<str>,
     pub(crate) data: DataMap,
     /// `TypeId` do job -> `KeyFn<J>` (para gravar a key de concorrência já no enqueue).
     pub(crate) key_fns: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
     pub(crate) on_event: Option<EventHandler>,
     pub(crate) completed_ttl_ms: u64,
+    /// Buffer local dos enqueues feitos com o Redis fora do ar (`None` = desligado).
+    pub(crate) buffer: Option<Arc<Buffer>>,
 }
 
 impl Shared {
@@ -63,6 +67,9 @@ pub enum Enqueued {
     AlreadyExists,
     /// (reconcile) Concluído há pouco (dentro do `completed_ttl`); não foi recriado.
     RecentlyCompleted,
+    /// O Redis estava inacessível: o job foi salvo no buffer local e é enviado, na ordem, assim
+    /// que o Redis voltar. Nenhuma instância o executa antes disso.
+    Buffered,
 }
 
 impl Enqueued {
@@ -119,6 +126,35 @@ impl Due {
             Self::At(at) => at.timestamp_millis().max(0).to_string(),
         }
     }
+
+    /// Formato do buffer: um atraso vira um instante (relógio local), para contar a partir da
+    /// chamada e não de quando o Redis voltar.
+    fn buffered(&self) -> String {
+        match self {
+            Self::In(d) if !d.is_zero() => TimeDelta::from_std(*d)
+                .ok()
+                .and_then(|d| Utc::now().checked_add_signed(d))
+                .map_or_else(|| self.encode(), |at| Self::At(at).encode()),
+            _ => self.encode(),
+        }
+    }
+}
+
+/// Envia jobs já serializados `(task_id, payload, due, key)` com o script de enqueue.
+/// `mode`: `u` (upsert) ou `n` (só se não existir, usado pelo reconcile).
+pub(crate) async fn send_jobs<'a>(
+    conn: &mut RedisConn,
+    keys: &QueueKeys,
+    mode: &str,
+    jobs: impl IntoIterator<Item = (&'a str, &'a str, &'a str, &'a str)>,
+) -> Result<Vec<Enqueued>> {
+    let mut inv = keys.invocation(&scripts::ENQUEUE_SCRIPT);
+    inv.arg(mode);
+    for (id, payload, due, key) in jobs {
+        inv.arg(id).arg(payload).arg(due).arg(key);
+    }
+    let statuses: Vec<String> = inv.invoke_async(conn).await?;
+    statuses.iter().map(|s| Enqueued::parse(s)).collect()
 }
 
 /// Handle leve (clonável) para manipular filas. Também é um extractor.
@@ -128,7 +164,9 @@ pub struct RekkaClient {
 }
 
 impl RekkaClient {
-    /// Enfileira para execução imediata (upsert pelo `task_id`).
+    /// Enfileira para execução imediata (upsert pelo `task_id`). Com o Redis fora do ar, o job
+    /// vai para o buffer local e o retorno é [`Enqueued::Buffered`] (o mesmo vale para
+    /// `schedule`, `schedule_in` e `immediate_many`).
     pub async fn immediate<J: RekkaQueue>(&self, job: J) -> Result<Enqueued> {
         self.enqueue_one(job, Due::In(Duration::ZERO), false).await
     }
@@ -198,7 +236,7 @@ impl RekkaClient {
     }
 
     #[inline]
-    pub(crate) fn conn(&self) -> ConnectionManager {
+    pub(crate) fn conn(&self) -> RedisConn {
         self.shared.conn.clone()
     }
 
@@ -215,13 +253,14 @@ impl RekkaClient {
         let keys = QueueKeys::new(&self.shared.prefix, J::NAME);
         let key_fn = self.shared.key_fn::<J>();
         let mode = if only_new { "n" } else { "u" };
+        // O reconcile não usa o buffer: com o Redis fora ele falha, e roda de novo quando o Redis volta.
+        let buffer = if only_new { None } else { self.shared.buffer.as_deref() };
         let mut conn = self.conn();
         let mut out = Vec::new();
         let mut jobs = jobs.peekable();
 
         while jobs.peek().is_some() {
-            let mut inv = keys.invocation(&scripts::ENQUEUE_SCRIPT);
-            inv.arg(mode);
+            let mut chunk = Vec::new();
             for (job, due) in jobs.by_ref().take(ENQUEUE_CHUNK) {
                 let id = job.task_id();
                 if id.is_empty() {
@@ -229,11 +268,36 @@ impl RekkaClient {
                 }
                 let payload = serde_json::to_string(&job)?;
                 let key = key_fn.map(|f| f(&job)).unwrap_or_default();
-                inv.arg(id).arg(payload).arg(due.encode()).arg(key);
+                chunk.push((id, payload, due, key));
             }
-            let statuses: Vec<String> = inv.invoke_async(&mut conn).await?;
-            for s in &statuses {
-                out.push(Enqueued::parse(s)?);
+            let entries = || {
+                let entry = |(id, p, due, k): &(String, String, Due, String)| Entry {
+                    q: J::NAME.to_owned(),
+                    id: id.clone(),
+                    p: p.clone(),
+                    due: due.buffered(),
+                    k: k.clone(),
+                };
+                chunk.iter().map(entry).collect::<Vec<_>>()
+            };
+            // Ainda há jobs no buffer: este vai atrás deles, para não chegar antes ao Redis.
+            if buffer.is_some_and(|b| b.append_if_pending(entries)) {
+                out.extend(std::iter::repeat_n(Enqueued::Buffered, chunk.len()));
+                continue;
+            }
+            let dues: Vec<String> = chunk.iter().map(|(_, _, due, _)| due.encode()).collect();
+            let jobs =
+                chunk.iter().zip(&dues).map(|((id, p, _, k), due)| (id.as_str(), p.as_str(), due.as_str(), k.as_str()));
+            match (send_jobs(&mut conn, &keys, mode, jobs).await, buffer) {
+                (Ok(statuses), _) => out.extend(statuses),
+                (Err(RekkaError::Redis(e)), Some(buffer)) if e.is_io_error() => {
+                    if let Err(io) = buffer.append(&entries()) {
+                        warn!(error = %io, "rekka: failed to write the offline buffer");
+                        return Err(RekkaError::Redis(e));
+                    }
+                    out.extend(std::iter::repeat_n(Enqueued::Buffered, chunk.len()));
+                }
+                (Err(e), _) => return Err(e),
             }
         }
         Ok(out)

@@ -27,16 +27,19 @@ impl QueueKeys {
 pub(crate) struct RecursiveKeys {
     pub(crate) next: String,
     pub(crate) lock: String,
+    /// Execução devida por uma reconexão (só o reconcile usa).
+    pub(crate) recovery: String,
 }
 
 impl RecursiveKeys {
     pub(crate) fn new(prefix: &str, name: &str) -> Self {
-        Self { next: format!("{prefix}:{{rec:{name}}}:next"), lock: format!("{prefix}:{{rec:{name}}}:lock") }
+        let base = format!("{prefix}:{{rec:{name}}}:");
+        Self { next: format!("{base}next"), lock: format!("{base}lock"), recovery: format!("{base}recovery") }
     }
 
     pub(crate) fn invocation<'a>(&self, script: &'a redis::Script) -> redis::ScriptInvocation<'a> {
         let mut inv = script.prepare_invoke();
-        inv.key(&self.next).key(&self.lock);
+        inv.key(&self.next).key(&self.lock).key(&self.recovery);
         inv
     }
 }

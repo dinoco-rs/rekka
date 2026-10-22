@@ -12,9 +12,11 @@ Rekka is a Rust library for Redis-backed job queues and a typed cache, built to 
 │   │   ├── src/
 │   │   │   ├── runtime.rs  QueuesBuilder (configuration, validation, start) and Queues (running handle)
 │   │   │   ├── worker.rs   RekkaWorker options and the queue loop: claim, heartbeat, reaper, finalize
-│   │   │   ├── recursive.rs Recurring workers (`interval` or `cron_time`) and reconcile (one instance per cycle via a Redis lock)
+│   │   │   ├── recursive.rs Recurring workers (`interval` or `cron_time`) and reconcile (one instance per cycle via a Redis lock; reconcile counts its interval from the end of the previous run)
 │   │   │   ├── cron.rs     Cron expression parser (node-cron format, optional seconds) and next-occurrence search
 │   │   │   ├── client.rs   RekkaClient (enqueue, remove, state, stats, purge), ReconcileHandler
+│   │   │   ├── conn.rs     RedisConn: the shared connection (fails fast while Redis is down, replaces silent connections, signals recoveries)
+│   │   │   ├── buffer.rs   Offline buffer: enqueues made while Redis is down go to `<buffer_dir>/<prefix>.<n>.jsonl` and are sent in order
 │   │   │   ├── job.rs      RekkaQueue, JobHandler, RetryPolicy, RekkaExecutionResult
 │   │   │   ├── handler.rs  JobFn / TaskFn: handlers with up to 8 extractors
 │   │   │   ├── context.rs  FromContext, RekkaContext, RekkaData
@@ -43,6 +45,7 @@ Rekka is a Rust library for Redis-backed job queues and a typed cache, built to 
 - The suite needs a Redis server: `REKKA_REDIS_URL` (default `redis://127.0.0.1:6379`).
 - `tests/suite/common.rs` gives each test its own prefix (`rekka-test-*`) and deletes its keys on drop, so tests run in parallel against one server.
 - New topics go in `tests/suite/<topic>.rs` and must be added to `tests/suite/main.rs`.
+- `tests/suite/outage.rs` has `RedisProxy`, a TCP proxy in front of the test Redis: `down()`/`up()` simulate an outage, `stall()` a connection that goes silent. Build with `env.builder_at(proxy.url())`.
 
 ```bash
 REKKA_REDIS_URL=redis://127.0.0.1:6379 cargo test

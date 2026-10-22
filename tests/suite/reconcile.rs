@@ -208,3 +208,82 @@ async fn add_many_and_errors() {
     );
     q.shutdown().await.unwrap();
 }
+
+/// Início e fim de cada execução do reconcile lento.
+#[derive(Default)]
+struct Runs {
+    active: AtomicUsize,
+    overlapped: AtomicUsize,
+    spans: Mutex<Vec<(tokio::time::Instant, tokio::time::Instant)>>,
+}
+
+impl Runs {
+    async fn track(&self, duration: Duration) {
+        if self.active.fetch_add(1, Ordering::SeqCst) > 0 {
+            self.overlapped.fetch_add(1, Ordering::SeqCst);
+        }
+        let started = tokio::time::Instant::now();
+        tokio::time::sleep(duration).await;
+        self.spans.lock().unwrap().push((started, tokio::time::Instant::now()));
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+async fn slow_reconcile(RekkaData(runs): RekkaData<Runs>) {
+    runs.track(ms(300)).await;
+}
+
+async fn long_reconcile(RekkaData(runs): RekkaData<Runs>) {
+    runs.track(Duration::from_secs(11)).await;
+}
+
+/// O intervalo conta do fim da execução anterior: um reconcile mais lento que o intervalo não
+/// emenda no próximo, em nenhuma das instâncias.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconcile_interval_starts_after_the_previous_run_ends() {
+    let env = TestEnv::new();
+    let runs = Arc::new(Runs::default());
+    let mut instances = Vec::new();
+    for _ in 0..3 {
+        let q = env.builder().data_arc(runs.clone()).with_reconcile(slow_reconcile, ms(200)).start().await.unwrap();
+        instances.push(q);
+    }
+
+    // Execuções em t = 0-300, 500-800, 1000-1300ms (com início a início seriam emendadas).
+    tokio::time::sleep(ms(1400)).await;
+    for q in &instances {
+        q.shutdown().await.unwrap();
+    }
+
+    assert_eq!(runs.overlapped.load(Ordering::SeqCst), 0);
+    let mut spans = runs.spans.lock().unwrap().clone();
+    spans.sort();
+    assert!(spans.len() >= 2, "reconcile ran {} times", spans.len());
+    for pair in spans.windows(2) {
+        let gap = pair[1].0.duration_since(pair[0].1);
+        assert!(gap >= ms(180), "next run started {gap:?} after the previous one ended");
+    }
+}
+
+/// O lock se perde no meio de uma execução (Redis fora por mais que a lease): como o heartbeat
+/// mantém a próxima execução `interval` à frente, outra instância não começa em paralelo.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconcile_lock_loss_does_not_start_a_parallel_run() {
+    let env = TestEnv::new();
+    let runs = Arc::new(Runs::default());
+    let start = || env.builder().data_arc(runs.clone()).with_reconcile(long_reconcile, Duration::from_secs(5)).start();
+
+    // Executa de 0 a 11s; o primeiro heartbeat (lease / 3 = 10s) empurra a próxima para 15s.
+    let a = start().await.unwrap();
+    tokio::time::sleep(ms(10_500)).await;
+    let mut conn = env.redis().await;
+    let lock = format!("{}:{{rec:__reconcile_0}}:lock", env.prefix);
+    let _: () = redis::cmd("DEL").arg(&lock).query_async(&mut conn).await.unwrap();
+    let b = start().await.unwrap();
+
+    tokio::time::sleep(ms(1500)).await;
+    b.shutdown().await.unwrap();
+    a.shutdown().await.unwrap();
+    assert_eq!(runs.overlapped.load(Ordering::SeqCst), 0, "another instance started while the first was running");
+    assert_eq!(runs.spans.lock().unwrap().len(), 1);
+}

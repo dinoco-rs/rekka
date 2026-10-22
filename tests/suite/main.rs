@@ -12,6 +12,7 @@ mod enqueue;
 mod events;
 mod execution;
 mod keyed;
+mod outage;
 mod reconcile;
 mod recovery;
 mod recursive;

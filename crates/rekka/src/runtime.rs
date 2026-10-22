@@ -1,22 +1,24 @@
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
-use redis::aio::ConnectionManagerConfig;
 use tokio::sync::Notify;
 use tokio::task::AbortHandle;
-use tokio::time::{Instant, sleep};
+use tokio::time::{Instant, interval_at, sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::warn;
 
+use crate::buffer::Buffer;
 use crate::cache::Cache;
 use crate::client::{Enqueued, JobState, QueueStats, RekkaClient, Removed, Shared};
+use crate::conn::RedisConn;
 use crate::context::{DataMap, RekkaContext};
 use crate::error::{RekkaError, Result};
 use crate::event::{EventHandler, JobEvent};
@@ -46,6 +48,7 @@ pub struct QueuesBuilder {
     handle_signals: bool,
     connection_timeout: Duration,
     response_timeout: Duration,
+    buffer_dir: Option<PathBuf>,
 }
 
 impl QueuesBuilder {
@@ -69,6 +72,9 @@ impl QueuesBuilder {
     /// Executa `f` a cada `interval` em uma única instância por ciclo, com o mesmo agendamento
     /// compartilhado de um worker recorrente: com várias instâncias rodando, só uma executa.
     /// Na primeira subida (sem agendamento no Redis), executa na hora.
+    ///
+    /// O `interval` conta do fim da execução anterior: enquanto um reconcile está rodando, o
+    /// próximo não é agendado, então execuções lentas nunca emendam umas nas outras.
     ///
     /// Use o extractor [`ReconcileHandler`](crate::ReconcileHandler) para (re)adicionar jobs
     /// sem duplicar nem interromper os que já existem.
@@ -156,6 +162,21 @@ impl QueuesBuilder {
         self
     }
 
+    /// Diretório do buffer local onde `immediate`, `schedule`, `schedule_in` e `immediate_many`
+    /// guardam os jobs enquanto o Redis está fora do ar (padrão: `<temp>/rekka`). Use um
+    /// diretório que sobreviva a restarts (um volume em containers): um job no buffer só existe
+    /// nesse arquivo até o Redis voltar.
+    pub fn buffer_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.buffer_dir = Some(dir.into());
+        self
+    }
+
+    /// Desliga o buffer local: com o Redis fora do ar, os enqueues retornam o erro.
+    pub fn disable_buffer(mut self) -> Self {
+        self.buffer_dir = None;
+        self
+    }
+
     fn check(&self) -> std::result::Result<(), String> {
         if let Some(e) = self.errors.first() {
             return Err(e.clone());
@@ -200,12 +221,16 @@ impl QueuesBuilder {
             self.recursive.push(janitor.runner);
         }
 
+        let buffer = match &self.buffer_dir {
+            Some(dir) => Some(Arc::new(
+                Buffer::open(dir, &self.prefix)
+                    .map_err(|e| RekkaError::InvalidConfig(format!("offline buffer at `{}`: {e}", dir.display())))?,
+            )),
+            None => None,
+        };
+
         let client = redis::Client::open(self.url.as_str())?;
-        let config = ConnectionManagerConfig::new()
-            .set_connection_timeout(Some(self.connection_timeout))
-            .set_response_timeout(Some(self.response_timeout))
-            .set_max_delay(Duration::from_secs(2));
-        let mut conn = client.get_connection_manager_with_config(config).await?;
+        let mut conn = RedisConn::connect(client.clone(), self.connection_timeout, self.response_timeout).await?;
         for script in scripts::all() {
             script.load_async(&mut conn).await?;
         }
@@ -217,6 +242,7 @@ impl QueuesBuilder {
             key_fns: self.key_fns,
             on_event: self.on_event,
             completed_ttl_ms: millis(self.completed_ttl),
+            buffer,
         });
         let cx = RekkaContext { client: RekkaClient { shared: Arc::clone(&shared) } };
         for w in &self.workers {
@@ -247,15 +273,29 @@ impl QueuesBuilder {
         }
         if !channels.is_empty() {
             let token = token.clone();
+            let timeouts = (self.connection_timeout, self.response_timeout);
             let listener = async move {
-                supervise("notify listener", "", &token, || notify_listener(client.clone(), channels.clone(), token.clone()))
-                    .await;
+                supervise("notify listener", "", &token, || {
+                    notify_listener(client.clone(), channels.clone(), token.clone(), timeouts)
+                })
+                .await;
             };
             aborts.push(tracker.spawn(listener).abort_handle());
         }
         for recursive in self.recursive {
             let env = RecursiveEnv { cx: cx.clone(), token: token.clone(), shutdown_timeout: self.shutdown_timeout };
             aborts.push(tracker.spawn(recursive.into_future(env)).abort_handle());
+        }
+        if let Some(buffer) = &shared.buffer {
+            let (buffer, conn, prefix, token) =
+                (Arc::clone(buffer), shared.conn.clone(), Arc::clone(&shared.prefix), token.clone());
+            let sync = async move {
+                supervise("offline buffer", "", &token, || {
+                    crate::buffer::sync_loop(Arc::clone(&buffer), conn.clone(), Arc::clone(&prefix), token.clone())
+                })
+                .await;
+            };
+            aborts.push(tracker.spawn(sync).abort_handle());
         }
         tracker.close();
 
@@ -273,23 +313,43 @@ impl QueuesBuilder {
 }
 
 /// Assina os canais de notificação das filas para acordar os workers assim que um job
-/// fica disponível. Se a conexão cair, os workers continuam por polling.
-async fn notify_listener(client: redis::Client, channels: HashMap<String, Arc<Notify>>, token: CancellationToken) {
+/// fica disponível. Se a conexão cair, os workers continuam por polling até ela voltar.
+async fn notify_listener(
+    client: redis::Client,
+    channels: HashMap<String, Arc<Notify>>,
+    token: CancellationToken,
+    (connection_timeout, response_timeout): (Duration, Duration),
+) {
     let names: Vec<&str> = channels.keys().map(String::as_str).collect();
+    let timed_out = |_| redis::RedisError::from(std::io::Error::from(std::io::ErrorKind::TimedOut));
+    // A assinatura só recebe: sem um PING periódico, uma conexão que parou de responder sem
+    // fechar (failover, partição) nunca seria percebida e as notificações parariam de chegar.
+    let ping_every = (response_timeout * 2).clamp(Duration::from_secs(1), Duration::from_secs(30));
     let mut backoff = Backoff::new();
     loop {
         let session = async {
-            let mut pubsub = client.get_async_pubsub().await?;
-            pubsub.subscribe(&names).await?;
+            let pubsub = timeout(connection_timeout, client.get_async_pubsub()).await.map_err(timed_out)??;
+            let (mut sink, mut messages) = pubsub.split();
+            timeout(response_timeout, sink.subscribe(&names)).await.map_err(timed_out)??;
             // Mensagens podem ter sido perdidas enquanto estava desconectado.
             for wake in channels.values() {
                 wake.notify_one();
             }
             let connected = Instant::now();
-            let mut messages = pubsub.on_message();
-            while let Some(msg) = messages.next().await {
-                if let Some(wake) = channels.get(msg.get_channel_name()) {
-                    wake.notify_one();
+            let mut ping = interval_at(connected + ping_every, ping_every);
+            loop {
+                tokio::select! {
+                    msg = messages.next() => match msg {
+                        Some(msg) => {
+                            if let Some(wake) = channels.get(msg.get_channel_name()) {
+                                wake.notify_one();
+                            }
+                        }
+                        None => break,
+                    },
+                    _ = ping.tick() => {
+                        timeout(response_timeout, sink.ping::<redis::Value>()).await.map_err(timed_out)??;
+                    }
                 }
             }
             Ok::<_, redis::RedisError>(connected.elapsed())
@@ -344,6 +404,7 @@ impl Queues {
             handle_signals: true,
             connection_timeout: Duration::from_secs(5),
             response_timeout: Duration::from_secs(5),
+            buffer_dir: Some(std::env::temp_dir().join("rekka")),
         }
     }
 

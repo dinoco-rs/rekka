@@ -21,6 +21,8 @@ pub enum RekkaError {
     ShutdownTimeout { abandoned: usize },
     /// O Redis respondeu algo inesperado.
     Protocol(String),
+    /// Falha ao ler ou gravar o buffer local de enqueues feitos com o Redis fora do ar.
+    Buffer(std::io::Error),
 }
 
 pub type Result<T, E = RekkaError> = std::result::Result<T, E>;
@@ -38,6 +40,7 @@ impl fmt::Display for RekkaError {
                 write!(f, "shutdown timed out; {abandoned} job(s) were returned to their queues")
             }
             Self::Protocol(msg) => write!(f, "unexpected redis response: {msg}"),
+            Self::Buffer(e) => write!(f, "offline buffer error: {e}"),
         }
     }
 }
@@ -47,6 +50,7 @@ impl std::error::Error for RekkaError {
         match self {
             Self::Redis(e) => Some(e),
             Self::Serialization(e) => Some(e),
+            Self::Buffer(e) => Some(e),
             _ => None,
         }
     }

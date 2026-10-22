@@ -37,11 +37,42 @@ impl TestEnv {
 
     /// Builder já apontando para o prefixo do teste, sem tratar sinais e com polling curto.
     pub fn builder(&self) -> QueuesBuilder {
-        Queues::new(redis_url())
+        self.builder_at(redis_url())
+    }
+
+    /// Igual a [`builder`](Self::builder), conectando em outra URL (ex.: um [`RedisProxy`](crate::outage::RedisProxy)).
+    pub fn builder_at(&self, url: String) -> QueuesBuilder {
+        Queues::new(url)
             .prefix(self.prefix.clone())
+            .buffer_dir(self.buffer_dir())
             .handle_signals(false)
             .poll_interval(ms(250))
             .connection_timeout(Duration::from_secs(2))
+    }
+
+    /// Diretório do buffer local deste teste (apagado no `Drop`).
+    pub fn buffer_dir(&self) -> std::path::PathBuf {
+        std::env::temp_dir().join("rekka-tests").join(&self.prefix)
+    }
+
+    /// Jobs (`task_id`) no buffer local que ainda não foram enviados ao Redis.
+    pub fn buffered(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let Ok(dir) = std::fs::read_dir(self.buffer_dir()) else { return out };
+        for entry in dir.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|e| e != "jsonl") {
+                continue;
+            }
+            let raw = std::fs::read(&path).unwrap_or_default();
+            let sent: usize =
+                std::fs::read_to_string(path.with_extension("sent")).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+            for line in raw.get(sent..).unwrap_or_default().split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+                let value: serde_json::Value = serde_json::from_slice(line).unwrap();
+                out.push(value["id"].as_str().unwrap().to_owned());
+            }
+        }
+        out
     }
 
     /// Instância que só produz (nenhum worker registrado).
@@ -100,6 +131,7 @@ impl TestEnv {
 
 impl Drop for TestEnv {
     fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(self.buffer_dir());
         let prefix = self.prefix.clone();
         // Roda numa thread própria: o Drop pode acontecer dentro do runtime tokio.
         let _ = std::thread::spawn(move || {

@@ -3,9 +3,9 @@ resolver = "3"
 members = ["crates/rekka", "crates/rekka_derives"]
 
 [workspace.package]
-version = "0.0.3"
+version = "0.0.4"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "Apache-2.0"
 homepage = "https://dinoco.io/docs/rekka"
 repository = "https://github.com/dinoco-rs/rekka"

@@ -65,7 +65,7 @@ async fn invalid_configuration_is_rejected() {
 async fn unreachable_redis_fails_at_start() {
     let res = tokio::time::timeout(
         Duration::from_secs(60),
-        Queues::new("redis://127.0.0.1:1").connection_timeout(Duration::from_millis(200)).start(),
+        Queues::new("redis://127.0.0.1:1").connection_timeout(Duration::from_millis(200)).disable_buffer().start(),
     )
     .await
     .expect("start must give up");

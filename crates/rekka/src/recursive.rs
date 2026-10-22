@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
+use tokio::sync::watch;
 use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep, sleep_until};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -14,11 +15,14 @@ use crate::event::{EventSource, JobEvent, JobEventKind};
 use crate::handler::{IntoTaskResult, TaskFn};
 use crate::keys::RecursiveKeys;
 use crate::scripts;
-use crate::util::{AbortOnDrop, Backoff, millis, panic_message, random_token, supervise};
+use crate::util::{AbortOnDrop, Backoff, is_transient, millis, panic_message, random_token, supervise};
 use crate::worker::BoxFuture;
 
 /// Espera máxima entre verificações do agendamento compartilhado.
 const MAX_WAIT: Duration = Duration::from_secs(30);
+/// Uma queda do Redis percebida por várias instâncias dentro desta janela gera uma única
+/// execução do reconcile quando ele volta.
+const RECOVERY_WINDOW: Duration = Duration::from_secs(60);
 
 /// Calcula a próxima execução de um `cron_time` no fuso configurado.
 type NextFn = Arc<dyn Fn(&CronTime, DateTime<Utc>) -> Option<DateTime<Utc>> + Send + Sync>;
@@ -27,6 +31,10 @@ type NextFn = Arc<dyn Fn(&CronTime, DateTime<Utc>) -> Option<DateTime<Utc>> + Se
 pub(crate) enum Schedule {
     /// A cada `interval`, contado do início da execução anterior. Na primeira subida, executa na hora.
     Interval(Duration),
+    /// A cada `interval`, contado do fim da execução anterior: a próxima só é agendada quando a
+    /// atual termina (ou, se a instância morrer, `interval` depois do último heartbeat). Na
+    /// primeira subida e quando o Redis volta de uma queda, executa na hora.
+    Delay(Duration),
     /// Nos instantes de uma expressão cron. Nunca executa na subida, só no próximo instante.
     Cron { expr: String, parsed: std::result::Result<CronTime, String>, next: NextFn },
 }
@@ -34,10 +42,10 @@ pub(crate) enum Schedule {
 impl Schedule {
     fn check(&self, name: &str) -> std::result::Result<(), String> {
         match self {
-            Self::Interval(interval) if *interval < Duration::from_millis(10) => {
+            Self::Interval(interval) | Self::Delay(interval) if *interval < Duration::from_millis(10) => {
                 Err(format!("`{name}`: interval must be at least 10ms"))
             }
-            Self::Interval(_) => Ok(()),
+            Self::Interval(_) | Self::Delay(_) => Ok(()),
             Self::Cron { expr, parsed: Err(e), .. } => Err(format!("`{name}`: invalid cron_time `{expr}`: {e}")),
             Self::Cron { expr, parsed: Ok(cron), next } => match next(cron, Utc::now()) {
                 Some(_) => Ok(()),
@@ -143,7 +151,9 @@ pub struct RecursiveWorker {
 
 impl RecursiveWorker {
     /// Reconcile segue o mesmo agendamento compartilhado de um worker recorrente: uma única
-    /// instância por ciclo, inclusive na subida (sem agendamento no Redis, roda na hora).
+    /// instância por ciclo, inclusive na subida (sem agendamento no Redis, roda na hora). O
+    /// `interval` conta do fim da execução anterior, então um reconcile lento nunca emenda no próximo.
+    /// Com o Redis fora do ar não roda; quando ele volta, roda uma vez, mesmo fora do horário.
     pub(crate) fn reconcile<F, M>(index: usize, interval: Duration, f: F) -> Self
     where
         F: TaskFn<M>,
@@ -155,7 +165,7 @@ impl RecursiveWorker {
                 key_name: format!("__reconcile_{index}"),
                 source: EventSource::Reconcile,
                 internal: false,
-                schedule: Schedule::Interval(interval),
+                schedule: Schedule::Delay(interval),
                 lease: Duration::from_secs(30),
                 f,
                 _m: PhantomData,
@@ -268,11 +278,27 @@ where
         }
     }
 
+    // Reconcile: roda de novo assim que o Redis volta de uma queda (uma vez, em uma instância).
+    let mut recoveries = matches!(rt.spec.schedule, Schedule::Delay(_)).then(|| rt.cx.client.shared.conn.recoveries());
+    let mut recovered = false;
+
     while !env.token.is_cancelled() {
+        if let Some(rx) = &mut recoveries
+            && rx.has_changed().unwrap_or(false)
+        {
+            rx.borrow_and_update();
+            recovered = true;
+        }
+        if recovered {
+            match rt.recover().await {
+                Ok(_) => recovered = false,
+                Err(e) => warn!(name = rt.spec.name, error = %e, "rekka: failed to schedule a run after reconnecting"),
+            }
+        }
         seq += 1;
         let token = format!("{instance}:{seq}");
         let claimed = match &rt.spec.schedule {
-            Schedule::Interval(interval) => rt.claim(&token, *interval).await,
+            Schedule::Interval(interval) | Schedule::Delay(interval) => rt.claim(&token, *interval).await,
             Schedule::Cron { parsed: Ok(cron), next, .. } => rt.claim_cron(&token, cron, next).await,
             // Rejeitado no `check`.
             Schedule::Cron { parsed: Err(_), .. } => return,
@@ -295,7 +321,15 @@ where
         tokio::select! {
             _ = sleep(wait) => {}
             _ = env.token.cancelled() => break,
+            Ok(()) = changed(&mut recoveries) => recovered = true,
         }
+    }
+}
+
+async fn changed(rx: &mut Option<watch::Receiver<u64>>) -> std::result::Result<(), watch::error::RecvError> {
+    match rx {
+        Some(rx) => rx.changed().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -305,8 +339,17 @@ where
     M: 'static,
 {
     async fn claim(&self, token: &str, interval: Duration) -> std::result::Result<(i64, i64), redis::RedisError> {
+        let window = if self.delay_ms() > 0 { millis(RECOVERY_WINDOW) } else { 0 };
         let mut inv = self.keys.invocation(&scripts::REC_CLAIM_SCRIPT);
-        inv.arg(token).arg(millis(interval)).arg(millis(self.spec.lease));
+        inv.arg(token).arg(millis(interval)).arg(millis(self.spec.lease)).arg(window);
+        inv.invoke_async(&mut self.cx.client.conn()).await
+    }
+
+    /// Marca uma execução devida pela volta do Redis: uma por queda, somando todas as instâncias.
+    async fn recover(&self) -> std::result::Result<i64, redis::RedisError> {
+        let keep = self.delay_ms().saturating_mul(2).saturating_add(millis(self.spec.lease) + millis(RECOVERY_WINDOW));
+        let mut inv = self.keys.invocation(&scripts::REC_RECOVER_SCRIPT);
+        inv.arg(keep);
         inv.invoke_async(&mut self.cx.client.conn()).await
     }
 
@@ -393,10 +436,24 @@ where
             }
         };
 
+        // Com `Delay`, a próxima execução é agendada aqui, no mesmo script que libera o lock. Com
+        // o Redis fora, tenta até ele voltar: senão o lock só sairia quando a lease expirasse,
+        // atrasando a próxima execução depois da volta.
         let mut inv = self.keys.invocation(&scripts::REC_RELEASE_SCRIPT);
-        inv.arg(token);
-        if let Err(e) = inv.invoke_async::<i64>(&mut env.cx.client.conn()).await {
-            warn!(name, error = %e, "rekka: failed to release recursive worker lock");
+        inv.arg(token).arg(self.delay_ms()).arg(millis(self.spec.lease));
+        let mut backoff = Backoff::new();
+        loop {
+            match inv.invoke_async::<i64>(&mut env.cx.client.conn()).await {
+                Ok(_) => break,
+                Err(e) if is_transient(&e) && !env.token.is_cancelled() => tokio::select! {
+                    _ = sleep(backoff.next_delay()) => {}
+                    _ = env.token.cancelled() => {}
+                },
+                Err(e) => {
+                    warn!(name, error = %e, "rekka: failed to release recursive worker lock; it expires with the lease");
+                    break;
+                }
+            }
         }
 
         let kind = if outcome.is_ok() { JobEventKind::Succeeded } else { JobEventKind::Failed };
@@ -415,9 +472,17 @@ where
         });
     }
 
+    /// `interval` de um `Delay` (contado do fim da execução), 0 nos outros agendamentos.
+    fn delay_ms(&self) -> u64 {
+        match &self.spec.schedule {
+            Schedule::Delay(interval) => millis(*interval),
+            _ => 0,
+        }
+    }
+
     async fn extend(&self, token: &str, env: &RecursiveEnv) {
         let mut inv = self.keys.invocation(&scripts::REC_EXTEND_SCRIPT);
-        inv.arg(token).arg(millis(self.spec.lease));
+        inv.arg(token).arg(millis(self.spec.lease)).arg(self.delay_ms());
         match inv.invoke_async::<i64>(&mut env.cx.client.conn()).await {
             Ok(1) => {}
             // O lock expirou (Redis fora do ar por mais que a lease, restart sem persistência):

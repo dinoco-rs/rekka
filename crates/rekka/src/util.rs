@@ -104,7 +104,7 @@ pub(crate) fn glob_escape(s: &str) -> String {
 /// Remove (UNLINK) todas as chaves que casam com `pattern`, de forma incremental.
 /// Retorna quantas chaves satisfizeram `count`.
 pub(crate) async fn delete_matching(
-    conn: &mut redis::aio::ConnectionManager,
+    conn: &mut crate::conn::RedisConn,
     pattern: &str,
     mut count: impl FnMut(&str) -> bool,
 ) -> crate::Result<u64> {
