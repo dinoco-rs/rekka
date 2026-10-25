@@ -25,7 +25,7 @@ pub use client::{Enqueued, JobState, QueueStats, ReconcileHandler, RekkaClient, 
 pub use context::{FromContext, RekkaContext, RekkaData};
 pub use error::{RekkaError, Result};
 pub use event::{EventSource, JobEvent, JobEventKind};
-pub use handler::{IntoTaskResult, JobFn, TaskFn};
+pub use handler::{FutureSize, IntoTaskResult, JobFn, TaskFn};
 pub use job::{IntoExecutionResult, JobHandler, RekkaExecutionResult, RekkaQueue, RetryPolicy, ToTaskId};
 pub use recursive::{RecursiveWorker, RekkaRecursiveWorker};
 pub use rekka_derives::{RekkaCache, RekkaQueue};
@@ -36,6 +36,9 @@ pub use chrono;
 
 #[doc(hidden)]
 pub mod __private {
+    pub use crate::recursive::{TaskFutureSizes, task_future_sizes};
+    pub use crate::worker::{JobFutureSizes, job_future_sizes};
+
     /// Bounds de [`RekkaQueue`](crate::RekkaQueue), usados pelo derive em structs genéricas.
     pub trait QueueBound: serde::Serialize + serde::de::DeserializeOwned + Send + 'static {}
 

@@ -18,7 +18,7 @@ Rekka is a Rust library for Redis-backed job queues and a typed cache, built to 
 │   │   │   ├── conn.rs     RedisConn: the shared connection (fails fast while Redis is down, replaces silent connections, signals recoveries)
 │   │   │   ├── buffer.rs   Offline buffer: enqueues made while Redis is down go to `<buffer_dir>/<prefix>.<n>.jsonl` and are sent in order
 │   │   │   ├── job.rs      RekkaQueue, JobHandler, RetryPolicy, RekkaExecutionResult
-│   │   │   ├── handler.rs  JobFn / TaskFn: handlers with up to 8 extractors
+│   │   │   ├── handler.rs  JobFn / TaskFn: handlers with up to 8 extractors; `call` boxes the handler future; FutureSize
 │   │   │   ├── context.rs  FromContext, RekkaContext, RekkaData
 │   │   │   ├── cache.rs    Cache, CacheBuilder, RekkaCache
 │   │   │   ├── event.rs    JobEvent, JobEventKind, EventSource
@@ -28,8 +28,11 @@ Rekka is a Rust library for Redis-backed job queues and a typed cache, built to 
 │   │   └── examples/basic.rs
 │   └── rekka_derives/      `#[derive(RekkaQueue)]` and `#[derive(RekkaCache)]`
 ├── tests/suite/            Integration suite (one module per topic, registered in main.rs)
+├── tests/future_sizes.rs   Size budgets of rekka's internal futures (no Redis needed)
+├── tests/stack.rs          Large handlers on worker threads with a reduced stack (own binary: an overflow aborts it)
 ├── scripts/publish-crates.js  Publishes the crates in dependency order (`--dry-run`)
 ├── readme.md, crates.md    Repository README and crates.io README (absolute URLs); keep them in sync
+├── CHANGELOG.md            One entry per version
 └── rustfmt.toml            Same settings as the Dinoco repository
 ```
 
@@ -46,12 +49,25 @@ Rekka is a Rust library for Redis-backed job queues and a typed cache, built to 
 - `tests/suite/common.rs` gives each test its own prefix (`rekka-test-*`) and deletes its keys on drop, so tests run in parallel against one server.
 - New topics go in `tests/suite/<topic>.rs` and must be added to `tests/suite/main.rs`.
 - `tests/suite/outage.rs` has `RedisProxy`, a TCP proxy in front of the test Redis: `down()`/`up()` simulate an outage, `stall()` a connection that goes silent. Build with `env.builder_at(proxy.url())`.
+- `tests/stack.rs` reuses `tests/suite/common.rs` through `#[path]`.
 
 ```bash
 REKKA_REDIS_URL=redis://127.0.0.1:6379 cargo test
+cargo test --test future_sizes        # no Redis needed
 cargo run -p rekka --example basic   # also reads REDIS_URL
 ```
 
+## Performance: tamanho de future e stack
+
+- O future do handler do usuário tem tamanho arbitrário. O rekka o boxeia uma única vez, na fronteira (`call`), e nunca o embute nem o copia de novo. Os futures internos do rekka têm tamanho constante, independente do handler.
+- `tests/future_sizes.rs` guarda o orçamento de cada future interno (`run_job`, `execute`, `finalize`, loops). Se uma mudança passar do orçamento, o teste falha; aumente o orçamento só com o motivo medido na mensagem de commit.
+- `tests/stack.rs` roda handlers grandes num runtime com `thread_stack_size` reduzido, em debug. Ele tem que continuar passando.
+- Todo worker valida `size_of::<F::Future>()` no registro contra `max_future_size`. Não remova essa validação.
+- Não receba um future como argumento de `async fn` só para reembrulhar; prefira combinadores ou `impl Future`. O argumento e o local podem ocupar slots separados no estado.
+- Temporários do scrutinee de `match`/`if let` vivem até o fim do statement, inclusive através de um `.await` dentro dele. Faça o binding antes e só depois dê o await.
+- Não segure payloads, buffers ou structs grandes através de `.await` nos loops quentes.
+- Para inspecionar layouts: `RUSTC_BOOTSTRAP=1 cargo rustc --lib -- -Zprint-type-sizes`. PRs que mexem em claim/execute/finalize ou nos loops reportam tamanhos antes/depois.
+
 ## Releasing
 
-The version lives once in `[workspace.package]`. `crates/rekka/Cargo.toml` pins `rekka_derives` with `=<version>`, so bump both together, update `readme.md` and `crates.md`, and add a release-notes entry to the Rekka docs. Then run `node scripts/publish-crates.js --dry-run` before publishing.
+The version lives once in `[workspace.package]`. `crates/rekka/Cargo.toml` pins `rekka_derives` with `=<version>`, so bump both together, update `readme.md`, `crates.md` and `CHANGELOG.md`, and add a release-notes entry to the Rekka docs. Then run `node scripts/publish-crates.js --dry-run` before publishing.

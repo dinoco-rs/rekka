@@ -44,7 +44,7 @@ Add Rekka to your `Cargo.toml` dependencies:
 
 ```toml
 [dependencies]
-rekka = "0.0.4"
+rekka = "0.0.5"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```

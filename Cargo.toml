@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/rekka", "crates/rekka_derives"]
 
 [workspace.package]
-version = "0.0.4"
+version = "0.0.5"
 edition = "2024"
 rust-version = "1.89"
 license = "Apache-2.0"
@@ -36,3 +36,13 @@ uuid = { version = "1.28.0", features = ["serde", "v4"] }
 name = "suite"
 path = "tests/suite/main.rs"
 harness = true
+
+# Orçamento dos futures internos (sem Redis).
+[[test]]
+name = "future_sizes"
+path = "tests/future_sizes.rs"
+
+# Handlers grandes com stack reduzido: fora da suíte porque um stack overflow aborta o binário.
+[[test]]
+name = "stack"
+path = "tests/stack.rs"

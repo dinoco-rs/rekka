@@ -22,7 +22,7 @@ use crate::conn::RedisConn;
 use crate::context::{DataMap, RekkaContext};
 use crate::error::{RekkaError, Result};
 use crate::event::{EventHandler, JobEvent};
-use crate::handler::TaskFn;
+use crate::handler::{DEFAULT_MAX_FUTURE_SIZE, FutureSize, TaskFn};
 use crate::job::{RekkaQueue, ToTaskId};
 use crate::keys::{QueueKeys, validate_name};
 use crate::recursive::{ErasedRecursive, RecursiveEnv, RecursiveWorker, RekkaRecursiveWorker};
@@ -49,6 +49,8 @@ pub struct QueuesBuilder {
     connection_timeout: Duration,
     response_timeout: Duration,
     buffer_dir: Option<PathBuf>,
+    max_future_size: usize,
+    strict_future_size: bool,
 }
 
 impl QueuesBuilder {
@@ -177,6 +179,27 @@ impl QueuesBuilder {
         self
     }
 
+    /// Tamanho máximo, em bytes, do future de um handler (padrão 16 KiB), para os workers que não
+    /// definem o próprio `max_future_size` (e para o reconcile). O tamanho é medido no `start()`:
+    /// acima do limite, um aviso; com [`strict_future_size`](Self::strict_future_size), erro.
+    /// Os tamanhos medidos ficam em [`Queues::future_sizes`].
+    pub fn max_future_size(mut self, bytes: usize) -> Self {
+        self.max_future_size = bytes;
+        self
+    }
+
+    /// Com `true`, um handler cujo future passa do `max_future_size` faz o `start()` falhar
+    /// (`RekkaError::InvalidConfig`) em vez de só emitir um aviso.
+    pub fn strict_future_size(mut self, strict: bool) -> Self {
+        self.strict_future_size = strict;
+        self
+    }
+
+    fn future_sizes(&self) -> Vec<FutureSize> {
+        let workers = self.workers.iter().map(|w| w.future_size(self.max_future_size));
+        workers.chain(self.recursive.iter().filter_map(|r| r.future_size(self.max_future_size))).collect()
+    }
+
     fn check(&self) -> std::result::Result<(), String> {
         if let Some(e) = self.errors.first() {
             return Err(e.clone());
@@ -203,12 +226,19 @@ impl QueuesBuilder {
             }
             r.check()?;
         }
+        if self.strict_future_size
+            && let Some(size) = self.future_sizes().iter().find(|s| s.exceeds_limit())
+        {
+            return Err(size.describe());
+        }
         Ok(())
     }
 
     /// Conecta ao Redis e inicia os workers. Retorna assim que tudo estiver rodando.
     pub async fn start(mut self) -> Result<Queues> {
         self.check().map_err(RekkaError::InvalidConfig)?;
+        let future_sizes = self.future_sizes();
+        warn_oversized(&future_sizes);
 
         if !self.workers.is_empty() && !self.cleanup_interval.is_zero() {
             let mut names: Vec<&'static str> = self.workers.iter().map(|w| w.name()).collect();
@@ -307,8 +337,23 @@ impl QueuesBuilder {
                 aborts: Mutex::new(aborts),
                 abandoned,
                 handle_signals: self.handle_signals,
+                future_sizes,
             }),
         })
+    }
+}
+
+/// Fora do `start()`: em debug, o `warn!` aumentaria o frame de cada poll dele.
+fn warn_oversized(sizes: &[FutureSize]) {
+    for size in sizes.iter().filter(|s| s.exceeds_limit()) {
+        warn!(
+            source = ?size.source,
+            name = size.name,
+            size = size.size,
+            limit = size.limit,
+            "rekka: {}",
+            size.describe()
+        );
     }
 }
 
@@ -376,6 +421,7 @@ struct Runtime {
     aborts: Mutex<Vec<AbortHandle>>,
     abandoned: Arc<AtomicUsize>,
     handle_signals: bool,
+    future_sizes: Vec<FutureSize>,
 }
 
 /// Handle das filas em execução. Clonável e barato.
@@ -405,6 +451,8 @@ impl Queues {
             connection_timeout: Duration::from_secs(5),
             response_timeout: Duration::from_secs(5),
             buffer_dir: Some(std::env::temp_dir().join("rekka")),
+            max_future_size: DEFAULT_MAX_FUTURE_SIZE,
+            strict_future_size: false,
         }
     }
 
@@ -453,6 +501,12 @@ impl Queues {
     /// Cache usando a mesma conexão e o mesmo prefixo.
     pub fn cache(&self) -> Cache {
         self.inner.client.cache()
+    }
+
+    /// Tamanho do future de cada handler registrado (filas, workers recorrentes e reconcile),
+    /// medido no `start()` contra o `max_future_size`.
+    pub fn future_sizes(&self) -> &[FutureSize] {
+        &self.inner.future_sizes
     }
 
     /// Aguarda o encerramento: via [`shutdown`](Self::shutdown) ou, se habilitado, SIGINT/SIGTERM.

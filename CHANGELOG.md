@@ -1,0 +1,8 @@
+# Changelog
+
+## 0.0.5 (unreleased)
+
+- **Handler futures are boxed once.** `JobFn::call` and `TaskFn::call` box the handler future where it is created, so Rekka's internal futures (`run_job`, `execute`, the queue and recurring-worker loops) keep a constant size whatever the handler holds across `.await`. Before, a queue embedded the handler future three times per job and copied it through every frame of the spawn path: in a debug build a 64 KiB handler needed about 1 MiB of worker-thread stack, and a 128 KiB one overflowed Tokio's default 2 MiB. It now takes about 120 KiB, and a 256 KiB handler about 270 KiB. Recurring workers, reconcile and cron schedules go through the same path. The cost is one allocation per run.
+- **Handler size check at startup.** `start()` measures the future of every handler (`size_of`) and logs a warning with its name, size and limit when it is larger than `max_future_size` (16 KiB by default). Set the limit per worker with `RekkaWorker::max_future_size` or `RekkaRecursiveWorker::max_future_size`, or for every handler, reconcile included, with `QueuesBuilder::max_future_size`. With `QueuesBuilder::strict_future_size(true)`, `start()` fails with `RekkaError::InvalidConfig` instead. `Queues::future_sizes()` lists the measured sizes (`FutureSize`).
+- **Breaking: `JobFn::call` and `TaskFn::call` return `Pin<Box<Self::Future>>`.** This only affects code that calls these methods or implements the traits by hand. Handlers written as `async fn` or closures need no change.
+- A handler whose future is larger than 16 KiB now logs a warning at startup. Raise its `max_future_size`, or box the heavy part of the handler (`Box::pin`).

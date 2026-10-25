@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use futures_util::FutureExt;
+use futures_util::future::Either;
 use redis::{FromRedisValue, RedisError, ScriptInvocation};
 use tokio::sync::Notify;
 use tokio::task::{Id as TaskId, JoinError, JoinSet};
@@ -20,11 +21,11 @@ use crate::client::{KeyFn, Shared};
 use crate::context::RekkaContext;
 use crate::error::Result;
 use crate::event::{EventSource, JobEvent, JobEventKind};
-use crate::handler::JobFn;
+use crate::handler::{FutureSize, JobFn};
 use crate::job::{IntoExecutionResult, JobHandler, RekkaExecutionResult, RekkaQueue, RetryPolicy};
 use crate::keys::QueueKeys;
 use crate::scripts;
-use crate::util::{Backoff, is_transient, millis, panic_message, random_between, supervise};
+use crate::util::{Backoff, is_transient, millis, output_size, panic_message, random_between, supervise};
 
 /// Máximo de jobs pegos por chamada do script de claim.
 const CLAIM_BATCH: usize = 128;
@@ -45,6 +46,7 @@ pub struct RekkaWorker<J> {
     key_fn: Option<KeyFn<J>>,
     timeout: Option<Duration>,
     lease: Duration,
+    max_future_size: Option<usize>,
 }
 
 impl<J: RekkaQueue> Default for RekkaWorker<J> {
@@ -62,6 +64,7 @@ impl<J: RekkaQueue> RekkaWorker<J> {
             key_fn: None,
             timeout: None,
             lease: Duration::from_secs(30),
+            max_future_size: None,
         }
     }
 
@@ -112,6 +115,15 @@ impl<J: RekkaQueue> RekkaWorker<J> {
         self
     }
 
+    /// Tamanho máximo, em bytes, do future do handler (padrão: o
+    /// [`max_future_size`](crate::QueuesBuilder::max_future_size) das filas, 16 KiB). Acima dele o
+    /// `start()` emite um aviso, ou falha com
+    /// [`strict_future_size`](crate::QueuesBuilder::strict_future_size).
+    pub fn max_future_size(mut self, bytes: usize) -> Self {
+        self.max_future_size = Some(bytes);
+        self
+    }
+
     pub fn build_fn<F, M>(self, f: F) -> Worker<J>
     where
         F: JobFn<J, M>,
@@ -144,6 +156,7 @@ pub(crate) trait ErasedWorker: Send {
     fn name(&self) -> &'static str;
     fn check(&self) -> std::result::Result<(), String>;
     fn validate(&self, cx: &RekkaContext) -> Result<()>;
+    fn future_size(&self, default_limit: usize) -> FutureSize;
     fn into_future(self: Box<Self>, env: LoopEnv) -> BoxFuture;
 }
 
@@ -180,6 +193,15 @@ where
         F::validate(cx)
     }
 
+    fn future_size(&self, default_limit: usize) -> FutureSize {
+        FutureSize {
+            source: EventSource::Queue,
+            name: J::NAME,
+            size: size_of::<F::Future>(),
+            limit: self.cfg.max_future_size.unwrap_or(default_limit),
+        }
+    }
+
     fn into_future(self: Box<Self>, env: LoopEnv) -> BoxFuture {
         let WorkerSpec { cfg, f, .. } = *self;
         let rt = Arc::new(QueueRt {
@@ -190,11 +212,20 @@ where
             f,
             _m: PhantomData,
         });
-        // Um pânico no loop (bug da lib) não pode parar a fila: o loop recomeça e os jobs que
-        // estavam executando voltam pela lease (reaper).
-        let token = env.token.clone();
-        Box::pin(async move { supervise("queue", J::NAME, &token, || queue_loop(Arc::clone(&rt), env.clone())).await })
+        Box::pin(supervised(rt, env))
     }
+}
+
+/// Um pânico no loop (bug da lib) não pode parar a fila: o loop recomeça e os jobs que
+/// estavam executando voltam pela lease (reaper).
+fn supervised<J, F, M>(rt: Arc<QueueRt<J, F, M>>, env: LoopEnv) -> impl Future<Output = ()> + Send
+where
+    J: RekkaQueue,
+    F: JobFn<J, M>,
+    M: 'static,
+{
+    let token = env.token.clone();
+    async move { supervise("queue", J::NAME, &token, || queue_loop(Arc::clone(&rt), env.clone())).await }
 }
 
 struct QueueRt<J, F, M> {
@@ -487,18 +518,18 @@ where
         }
     }
 
-    async fn execute(&self, fut: F::Future) -> RekkaExecutionResult {
-        let fut = AssertUnwindSafe(fut).catch_unwind();
-        let res = match self.cfg.timeout {
-            Some(limit) => match tokio::time::timeout(limit, fut).await {
-                Ok(res) => res,
-                Err(_) => return RekkaExecutionResult::Error(format!("job timed out after {limit:?}")),
-            },
-            None => fut.await,
-        };
-        match res {
+    /// Combinadores em vez de um `async fn` que recebe o future: o argumento e o local para onde
+    /// ele é movido ocupariam slots separados no estado.
+    fn execute(&self, fut: Pin<Box<F::Future>>) -> impl Future<Output = RekkaExecutionResult> + Send + use<J, F, M> {
+        let fut = AssertUnwindSafe(fut).catch_unwind().map(|res| match res {
             Ok(out) => out.into_execution_result(),
             Err(panic) => RekkaExecutionResult::Error(panic_message(panic)),
+        });
+        match self.cfg.timeout {
+            Some(limit) => Either::Left(tokio::time::timeout(limit, fut).map(move |res| {
+                res.unwrap_or_else(|_| RekkaExecutionResult::Error(format!("job timed out after {limit:?}")))
+            })),
+            None => Either::Right(fut),
         }
     }
 
@@ -604,9 +635,49 @@ where
         max_attempts: rt.cfg.max_attempts,
         last_attempt: rt.is_last_attempt(attempt),
     };
-    let result = match rt.f.call(handler, job, &rt.cx) {
-        Ok(fut) => rt.execute(fut).await,
-        Err(e) => RekkaExecutionResult::Error(e.to_string()),
+    // Fora do scrutinee (o temporário de um `match` vive até o fim do statement, através do
+    // `.await`) e num bloco próprio, para que `called` não atravesse também o `finalize`.
+    let result = {
+        let called = rt.f.call(handler, job, &rt.cx);
+        match called {
+            Ok(fut) => rt.execute(fut).await,
+            Err(e) => RekkaExecutionResult::Error(e.to_string()),
+        }
     };
     rt.finalize(id, attempt, result, payload, started).await;
+}
+
+/// Tamanhos, em bytes, dos futures internos de uma fila. Ver `tests/future_sizes.rs`.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct JobFutureSizes {
+    pub handler: usize,
+    pub run_job: usize,
+    pub execute: usize,
+    pub finalize: usize,
+    pub queue_loop: usize,
+    pub supervise: usize,
+}
+
+/// Mede os futures internos de uma fila com o handler `f`, sem criá-los.
+#[doc(hidden)]
+pub fn job_future_sizes<J, F, M>(_: &F) -> JobFutureSizes
+where
+    J: RekkaQueue,
+    F: JobFn<J, M>,
+    M: 'static,
+{
+    type Rt<J, F, M> = &'static QueueRt<J, F, M>;
+    type Boxed<J, F, M> = Pin<Box<<F as JobFn<J, M>>::Future>>;
+    type Finalize<J, F, M> = (Rt<J, F, M>, String, u32, RekkaExecutionResult, Option<Arc<str>>, Instant);
+    JobFutureSizes {
+        handler: size_of::<F::Future>(),
+        run_job: output_size(|(rt, claimed): (Arc<QueueRt<J, F, M>>, Claimed)| run_job(rt, claimed)),
+        execute: output_size(|(rt, fut): (Rt<J, F, M>, Boxed<J, F, M>)| rt.execute(fut)),
+        finalize: output_size(|(rt, id, attempt, result, payload, started): Finalize<J, F, M>| {
+            rt.finalize(id, attempt, result, payload, started)
+        }),
+        queue_loop: output_size(|(rt, env): (Arc<QueueRt<J, F, M>>, LoopEnv)| queue_loop(rt, env)),
+        supervise: output_size(|(rt, env): (Arc<QueueRt<J, F, M>>, LoopEnv)| supervised(rt, env)),
+    }
 }

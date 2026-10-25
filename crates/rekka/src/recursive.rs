@@ -1,8 +1,10 @@
+use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
+use futures_util::FutureExt;
 use tokio::sync::watch;
 use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep, sleep_until};
 use tokio_util::sync::CancellationToken;
@@ -12,10 +14,10 @@ use crate::context::RekkaContext;
 use crate::cron::CronTime;
 use crate::error::Result;
 use crate::event::{EventSource, JobEvent, JobEventKind};
-use crate::handler::{IntoTaskResult, TaskFn};
+use crate::handler::{FutureSize, IntoTaskResult, TaskFn};
 use crate::keys::RecursiveKeys;
 use crate::scripts;
-use crate::util::{AbortOnDrop, Backoff, is_transient, millis, panic_message, random_token, supervise};
+use crate::util::{AbortOnDrop, Backoff, is_transient, millis, output_size, panic_message, random_token, supervise};
 use crate::worker::BoxFuture;
 
 /// Espera máxima entre verificações do agendamento compartilhado.
@@ -63,6 +65,7 @@ pub struct RekkaRecursiveWorker {
     cron: Option<String>,
     timezone: NextFn,
     lease: Duration,
+    max_future_size: Option<usize>,
 }
 
 impl RekkaRecursiveWorker {
@@ -73,6 +76,7 @@ impl RekkaRecursiveWorker {
             cron: None,
             timezone: Arc::new(|cron, after| cron.next_after(after, &Utc)),
             lease: Duration::from_secs(30),
+            max_future_size: None,
         }
     }
 
@@ -120,6 +124,13 @@ impl RekkaRecursiveWorker {
         self
     }
 
+    /// Tamanho máximo, em bytes, do future do handler. Mesmo comportamento do
+    /// [`RekkaWorker::max_future_size`](crate::RekkaWorker::max_future_size).
+    pub fn max_future_size(mut self, bytes: usize) -> Self {
+        self.max_future_size = Some(bytes);
+        self
+    }
+
     pub fn build_fn<F, M>(self, f: F) -> RecursiveWorker
     where
         F: TaskFn<M>,
@@ -137,6 +148,7 @@ impl RekkaRecursiveWorker {
                 internal: false,
                 schedule,
                 lease: self.lease,
+                max_future_size: self.max_future_size,
                 f,
                 _m: PhantomData,
             }),
@@ -167,6 +179,7 @@ impl RecursiveWorker {
                 internal: false,
                 schedule: Schedule::Delay(interval),
                 lease: Duration::from_secs(30),
+                max_future_size: None,
                 f,
                 _m: PhantomData,
             }),
@@ -189,6 +202,7 @@ impl RecursiveWorker {
                 internal: true,
                 schedule: Schedule::Interval(interval),
                 lease: Duration::from_secs(30),
+                max_future_size: None,
                 f,
                 _m: PhantomData,
             }),
@@ -207,6 +221,8 @@ pub(crate) trait ErasedRecursive: Send {
     fn key_name(&self) -> &str;
     fn check(&self) -> std::result::Result<(), String>;
     fn validate(&self, cx: &RekkaContext) -> Result<()>;
+    /// `None` para tarefas internas (janitor).
+    fn future_size(&self, default_limit: usize) -> Option<FutureSize>;
     fn into_future(self: Box<Self>, env: RecursiveEnv) -> BoxFuture;
 }
 
@@ -217,6 +233,7 @@ struct RecursiveSpec<F, M> {
     internal: bool,
     schedule: Schedule,
     lease: Duration,
+    max_future_size: Option<usize>,
     f: F,
     _m: PhantomData<fn() -> M>,
 }
@@ -243,15 +260,32 @@ where
         F::validate(cx)
     }
 
+    fn future_size(&self, default_limit: usize) -> Option<FutureSize> {
+        (!self.internal).then(|| FutureSize {
+            source: self.source,
+            name: self.name,
+            size: size_of::<F::Future>(),
+            limit: self.max_future_size.unwrap_or(default_limit),
+        })
+    }
+
     fn into_future(self: Box<Self>, env: RecursiveEnv) -> BoxFuture {
         let keys = RecursiveKeys::new(&env.cx.client.shared.prefix, &self.key_name);
         let cx = env.cx.clone();
         let rt = Arc::new(RecursiveRt { spec: *self, keys, cx });
-        let token = env.token.clone();
-        Box::pin(async move {
-            let name = rt.spec.name;
-            supervise("recursive worker", name, &token, || recursive_loop(Arc::clone(&rt), env.clone())).await;
-        })
+        Box::pin(supervised(rt, env))
+    }
+}
+
+fn supervised<F, M>(rt: Arc<RecursiveRt<F, M>>, env: RecursiveEnv) -> impl Future<Output = ()> + Send
+where
+    F: TaskFn<M>,
+    M: 'static,
+{
+    let token = env.token.clone();
+    async move {
+        let name = rt.spec.name;
+        supervise("recursive worker", name, &token, || recursive_loop(Arc::clone(&rt), env.clone())).await;
     }
 }
 
@@ -407,10 +441,12 @@ where
             shared.emit(|| JobEvent::new(source, name, JobEventKind::Started));
         }
 
-        let outcome = match self.spec.f.call(&env.cx) {
+        // Fora do scrutinee: o temporário de um `match` vive até o fim do statement, através do `.await`.
+        let called = self.spec.f.call(&env.cx);
+        let outcome = match called {
             Err(e) => Err(e.to_string()),
             Ok(fut) => {
-                let mut task = AbortOnDrop(tokio::spawn(async move { fut.await.into_task_result() }));
+                let mut task = AbortOnDrop(tokio::spawn(fut.map(IntoTaskResult::into_task_result)));
                 let beat = self.spec.lease / 3;
                 let mut heartbeat = interval_at(Instant::now() + beat, beat);
                 heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -494,5 +530,31 @@ where
             ),
             Err(e) => warn!(name = self.spec.name, error = %e, "rekka: failed to extend recursive worker lock"),
         }
+    }
+}
+
+/// Tamanhos, em bytes, dos futures internos de um worker recorrente. Ver `tests/future_sizes.rs`.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct TaskFutureSizes {
+    pub handler: usize,
+    pub run: usize,
+    pub recursive_loop: usize,
+    pub supervise: usize,
+}
+
+/// Mede os futures internos de um worker recorrente com o handler `f`, sem criá-los.
+#[doc(hidden)]
+pub fn task_future_sizes<F, M>(_: &F) -> TaskFutureSizes
+where
+    F: TaskFn<M>,
+    M: 'static,
+{
+    type Run<F, M> = (&'static RecursiveRt<F, M>, &'static str, &'static RecursiveEnv);
+    TaskFutureSizes {
+        handler: size_of::<F::Future>(),
+        run: output_size(|(rt, token, env): Run<F, M>| rt.run(token, env)),
+        recursive_loop: output_size(|(rt, env): (Arc<RecursiveRt<F, M>>, RecursiveEnv)| recursive_loop(rt, env)),
+        supervise: output_size(|(rt, env): (Arc<RecursiveRt<F, M>>, RecursiveEnv)| supervised(rt, env)),
     }
 }

@@ -46,6 +46,11 @@ where
     }
 }
 
+/// `size_of` do valor que `f` devolveria, sem chamá-lo: mede o future de um `async fn` sem criá-lo.
+pub(crate) fn output_size<A, R>(_: impl FnOnce(A) -> R) -> usize {
+    size_of::<R>()
+}
+
 pub(crate) fn random_between(min: Duration, max: Duration) -> Duration {
     let (lo, hi) = if min <= max { (min, max) } else { (max, min) };
     let (lo, hi) = (millis(lo), millis(hi));
