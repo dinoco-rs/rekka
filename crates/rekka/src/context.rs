@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use crate::client::{ReconcileHandler, RekkaClient};
 use crate::error::{RekkaError, Result};
+use crate::event::EventSource;
+use crate::job::JobHandler;
 
 #[derive(Default)]
 pub(crate) struct DataMap(HashMap<TypeId, Arc<dyn Any + Send + Sync>>);
@@ -27,9 +29,28 @@ impl DataMap {
 #[derive(Clone)]
 pub struct RekkaContext {
     pub(crate) client: RekkaClient,
+    /// Quem chama o handler: fila (inclusive passos de workflow), worker recorrente ou reconcile.
+    pub(crate) source: EventSource,
+    /// Execução atual: presente só ao chamar o handler de um job.
+    pub(crate) job: Option<JobHandler>,
 }
 
 impl RekkaContext {
+    pub(crate) fn new(client: RekkaClient, source: EventSource) -> Self {
+        Self { client, source, job: None }
+    }
+
+    /// O mesmo contexto, para quem chama handlers de `source`.
+    pub(crate) fn for_source(&self, source: EventSource) -> Self {
+        Self { client: self.client.clone(), source, job: None }
+    }
+
+    /// Execução atual (o mesmo valor do extractor [`JobHandler`]). `None` em workers recorrentes,
+    /// no reconcile e no `validate` de um extractor.
+    pub fn job(&self) -> Option<&JobHandler> {
+        self.job.as_ref()
+    }
+
     /// Dado registrado com `.data(...)`.
     pub fn data<T: Send + Sync + 'static>(&self) -> Option<Arc<T>> {
         self.client.shared.data.get::<T>()
@@ -45,6 +66,12 @@ impl RekkaContext {
 }
 
 /// Argumentos extraídos do contexto para handlers de jobs, workers recorrentes e reconcile.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not an extractor",
+    label = "this argument is not the job and does not implement `FromContext`",
+    note = "after the job, a handler only takes extractors: `JobHandler`, `RekkaData<T>`, `RekkaClient`, `Cache`, \
+            `ReconcileHandler` or your own type implementing `FromContext`"
+)]
 pub trait FromContext: Sized + Send + 'static {
     fn from_context(cx: &RekkaContext) -> Result<Self>;
 
@@ -58,7 +85,7 @@ pub trait FromContext: Sized + Send + 'static {
 /// Acesso ao dado registrado com `.data(value)`.
 ///
 /// ```ignore
-/// async fn handler(h: JobHandler, job: MailJob, RekkaData(db): RekkaData<Db>) { ... }
+/// async fn handler(job: MailJob, RekkaData(db): RekkaData<Db>) { ... }
 /// ```
 pub struct RekkaData<T>(pub Arc<T>);
 
@@ -86,6 +113,27 @@ impl<T: Send + Sync + 'static> FromContext for RekkaData<T> {
         if cx.has_data::<T>() { Ok(()) } else { Err(RekkaError::MissingData(type_name::<T>())) }
     }
 }
+
+/// Só em handlers de job (filas e passos de workflow). Num worker recorrente ou no reconcile, o
+/// `start()` falha.
+impl FromContext for JobHandler {
+    #[inline]
+    fn from_context(cx: &RekkaContext) -> Result<Self> {
+        cx.job.clone().ok_or_else(|| RekkaError::InvalidConfig(JOB_HANDLER_OUTSIDE_JOB.into()))
+    }
+
+    fn validate(cx: &RekkaContext) -> Result<()> {
+        match cx.source {
+            EventSource::Queue => Ok(()),
+            EventSource::Recursive | EventSource::Reconcile => {
+                Err(RekkaError::InvalidConfig(JOB_HANDLER_OUTSIDE_JOB.into()))
+            }
+        }
+    }
+}
+
+const JOB_HANDLER_OUTSIDE_JOB: &str =
+    "`JobHandler` is only available to job handlers, not to recurring workers or reconcile functions";
 
 impl FromContext for RekkaClient {
     #[inline]

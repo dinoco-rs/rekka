@@ -25,7 +25,7 @@ struct Gate {
     release: Notify,
 }
 
-async fn tidy(h: JobHandler, job: TidyJob, RekkaData(probe): RekkaData<Probe>, RekkaData(gate): RekkaData<Gate>) -> RekkaExecutionResult {
+async fn tidy(job: TidyJob, RekkaData(probe): RekkaData<Probe>, RekkaData(gate): RekkaData<Gate>, h: JobHandler) -> RekkaExecutionResult {
     probe.record(h.task_id(), h.attempt(), 0, 0);
     match job.mode.as_str() {
         "cancel" => h.cancel(),
@@ -99,7 +99,7 @@ struct FixJob {
     key: u32,
 }
 
-async fn fix(h: JobHandler, _job: FixJob, RekkaData(probe): RekkaData<Probe>) {
+async fn fix(_job: FixJob, RekkaData(probe): RekkaData<Probe>, h: JobHandler) {
     probe.record(h.task_id(), h.attempt(), 0, 0);
 }
 
@@ -202,7 +202,7 @@ struct LegacyJob {
     task_id: u32,
 }
 
-async fn hold(h: JobHandler, job: TidyJob, RekkaData(probe): RekkaData<Probe>, RekkaData(gate): RekkaData<Gate>) {
+async fn hold(job: TidyJob, RekkaData(probe): RekkaData<Probe>, RekkaData(gate): RekkaData<Gate>, h: JobHandler) {
     probe.record(h.task_id(), h.attempt(), 0, 0);
     if job.mode == "gate" {
         gate.started.notify_one();

@@ -11,6 +11,10 @@
 //! - `P:{q}:g:<key>` LIST jobs aguardando a key ser liberada
 //! - `P:{q}:d:<id>`  STR  marca de "concluído recentemente" (TTL), usada pelo reconcile
 //!
+//! O passo `n` (a partir de 1) de um workflow cuja fila de entrada é `q` é uma fila com o mesmo
+//! modelo sob `P:{q}:n:` (`P:{q}:n:queue`, `P:{q}:n:j:<id>`, ...): mesma hash tag, então
+//! `ADVANCE` conclui um passo e enfileira o próximo num único script.
+//!
 //! O relógio é sempre o do Redis (`TIME`), então servidores com relógios diferentes
 //! não afetam agendamentos, leases e retries.
 
@@ -109,6 +113,44 @@ local function discard(id, jk)
   redis.call('ZREM', A, id)
   redis.call('DEL', jk)
   return 'removed'
+end
+
+-- mode: u=upsert | n=só cria se não existir nem tiver concluído há pouco.
+-- Retorna created | updated | pending | exists | completed.
+local function upsert(id, p, due, k, mode)
+  local jk = jkey(id)
+  local dk = PFX .. 'd:' .. id
+  local s = redis.call('HGET', jk, 's')
+  if mode == 'n' then
+    if s then return 'exists' end
+    if redis.call('EXISTS', dk) == 1 then return 'completed' end
+  else
+    redis.call('DEL', dk)
+  end
+  if not s then
+    if k ~= '' then
+      redis.call('HSET', jk, 'p', p, 'a', 0, 'k', k)
+    else
+      redis.call('HSET', jk, 'p', p, 'a', 0)
+    end
+    push_waiting(id, jk, due)
+    return 'created'
+  end
+  if s == 'r' then
+    redis.call('HSET', jk, 'np', p, 'nd', due, 'nk', k)
+    redis.call('HDEL', jk, 'rm')
+    return 'pending'
+  end
+  if s == 'g' then
+    local old = redis.call('HGET', jk, 'k')
+    if old then redis.call('LREM', gkey(old), 1, id) end
+  else
+    release_group(id, jk)
+  end
+  redis.call('HSET', jk, 'p', p, 'a', 0)
+  if k ~= '' then redis.call('HSET', jk, 'k', k) else redis.call('HDEL', jk, 'k') end
+  push_waiting(id, jk, due)
+  return 'updated'
 end
 ";
 
@@ -281,51 +323,30 @@ const ENQUEUE: &str = r"
 local mode = ARGV[2]
 local res = {}
 for i = 3, #ARGV, 4 do
-  local id, p, d, k = ARGV[i], ARGV[i + 1], ARGV[i + 2], ARGV[i + 3]
+  local d = ARGV[i + 2]
   local due
   if string.sub(d, 1, 1) == '+' then due = NOW + tonumber(string.sub(d, 2)) else due = tonumber(d) end
-  local jk = jkey(id)
-  local dk = PFX .. 'd:' .. id
-  local s = redis.call('HGET', jk, 's')
-  local r
-  if mode == 'n' then
-    if s then
-      r = 'exists'
-    elseif redis.call('EXISTS', dk) == 1 then
-      r = 'completed'
-    end
-  else
-    redis.call('DEL', dk)
-  end
-  if not r then
-    if not s then
-      if k ~= '' then
-        redis.call('HSET', jk, 'p', p, 'a', 0, 'k', k)
-      else
-        redis.call('HSET', jk, 'p', p, 'a', 0)
-      end
-      push_waiting(id, jk, due)
-      r = 'created'
-    elseif s == 'r' then
-      redis.call('HSET', jk, 'np', p, 'nd', due, 'nk', k)
-      redis.call('HDEL', jk, 'rm')
-      r = 'pending'
-    else
-      if s == 'g' then
-        local old = redis.call('HGET', jk, 'k')
-        if old then redis.call('LREM', gkey(old), 1, id) end
-      else
-        release_group(id, jk)
-      end
-      redis.call('HSET', jk, 'p', p, 'a', 0)
-      if k ~= '' then redis.call('HSET', jk, 'k', k) else redis.call('HDEL', jk, 'k') end
-      push_waiting(id, jk, due)
-      r = 'updated'
-    end
-  end
-  res[#res + 1] = r
+  res[#res + 1] = upsert(ARGV[i], ARGV[i + 1], due, ARGV[i + 3], mode)
 end
 return res
+";
+
+/// Passo de workflow concluído: finaliza o job no passo atual e enfileira a saída como entrada do
+/// próximo passo (mesmo `task_id`, mesma key de concorrência), atomicamente. Os passos de um
+/// workflow compartilham a hash tag da fila de entrada, então as chaves dos dois cabem no script.
+/// KEYS: queue, active, locks do passo atual, depois os do próximo.
+/// ARGV: prefix, id, attempt, prefix_do_próximo, payload, tomb_ms
+/// Retorna o mesmo que `COMPLETE` com `f`: done | rerun | removed | stale.
+const ADVANCE: &str = r"
+local id = ARGV[2]
+local jk = jkey(id)
+local f = redis.call('HMGET', jk, 's', 'a', 'rm', 'k')
+if f[1] ~= 'r' or tonumber(f[2]) ~= tonumber(ARGV[3]) then return 'stale' end
+if f[3] then return discard(id, jk) end
+local status = finish(id, jk, tonumber(ARGV[6]))
+Q, A, L, PFX, NOTIFIED = KEYS[4], KEYS[5], KEYS[6], ARGV[4], false
+upsert(id, ARGV[5], NOW, f[4] or '', 'u')
+return status
 ";
 
 /// ARGV: prefix, id. Retorna 0 = não existe, 1 = removido, 2 = em execução (resultado será descartado).
@@ -568,6 +589,7 @@ fn recursive_script(body: &str) -> Script {
 pub(crate) static CLAIM_SCRIPT: LazyLock<Script> = LazyLock::new(|| queue_script(CLAIM));
 pub(crate) static BIND_SCRIPT: LazyLock<Script> = LazyLock::new(|| queue_script(BIND));
 pub(crate) static COMPLETE_SCRIPT: LazyLock<Script> = LazyLock::new(|| queue_script(COMPLETE));
+pub(crate) static ADVANCE_SCRIPT: LazyLock<Script> = LazyLock::new(|| queue_script(ADVANCE));
 pub(crate) static EXTEND_SCRIPT: LazyLock<Script> = LazyLock::new(|| queue_script(EXTEND));
 pub(crate) static RELEASE_SCRIPT: LazyLock<Script> = LazyLock::new(|| queue_script(RELEASE));
 pub(crate) static REAP_SCRIPT: LazyLock<Script> = LazyLock::new(|| queue_script(REAP));
@@ -587,11 +609,12 @@ pub(crate) static REC_CRON_CLAIM_SCRIPT: LazyLock<Script> = LazyLock::new(|| rec
 pub(crate) static REC_RECOVER_SCRIPT: LazyLock<Script> = LazyLock::new(|| recursive_script(REC_RECOVER));
 
 /// Todos os scripts, carregados no `start()` para falhar cedo.
-pub(crate) fn all() -> [&'static Script; 20] {
+pub(crate) fn all() -> [&'static Script; 21] {
     [
         &CLAIM_SCRIPT,
         &BIND_SCRIPT,
         &COMPLETE_SCRIPT,
+        &ADVANCE_SCRIPT,
         &EXTEND_SCRIPT,
         &RELEASE_SCRIPT,
         &REAP_SCRIPT,

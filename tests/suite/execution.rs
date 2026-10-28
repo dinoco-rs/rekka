@@ -21,7 +21,7 @@ fn job(id: &str, mode: &str) -> ExecJob {
 }
 
 /// Comportamento escolhido pelo payload; a 2ª tentativa sempre tem sucesso.
-async fn behave(h: JobHandler, job: ExecJob, RekkaData(probe): RekkaData<Probe>) -> RekkaExecutionResult {
+async fn behave(job: ExecJob, RekkaData(probe): RekkaData<Probe>, h: JobHandler) -> RekkaExecutionResult {
     probe.record(h.task_id(), h.attempt(), 0, 0);
     assert_eq!(h.queue(), "exec");
     assert_eq!(h.task_id(), job.task_id);
@@ -136,7 +136,7 @@ struct UnitJob {
     task_id: u32,
 }
 
-async fn returns_unit(h: JobHandler, _job: UnitJob, RekkaData(probe): RekkaData<Probe>) {
+async fn returns_unit(_job: UnitJob, RekkaData(probe): RekkaData<Probe>, h: JobHandler) {
     probe.record(h.task_id(), h.attempt(), 0, 0);
 }
 
@@ -146,7 +146,7 @@ struct ResultJob {
     task_id: u32,
 }
 
-async fn returns_result(h: JobHandler, _job: ResultJob, RekkaData(probe): RekkaData<Probe>) -> Result<(), std::io::Error> {
+async fn returns_result(_job: ResultJob, RekkaData(probe): RekkaData<Probe>, h: JobHandler) -> Result<(), std::io::Error> {
     probe.record(h.task_id(), h.attempt(), 0, 0);
     if h.attempt() == 1 { Err(std::io::Error::other("io failed")) } else { Ok(()) }
 }
@@ -194,7 +194,7 @@ struct ConsumerShape {
     count: u32,
 }
 
-async fn never_called(_h: JobHandler, _job: ConsumerShape) {
+async fn never_called(_job: ConsumerShape) {
     panic!("must not run with an invalid payload");
 }
 
@@ -238,11 +238,11 @@ struct SecondJob {
 
 /// Vários extractors + encadeamento: um job enfileira outro pelo `RekkaClient`.
 async fn first(
-    h: JobHandler,
     job: FirstJob,
     RekkaData(probe): RekkaData<Probe>,
     config: RekkaData<Config>,
     client: RekkaClient,
+    h: JobHandler,
 ) -> rekka::Result<()> {
     probe.record(h.task_id(), h.attempt(), job.value, 0);
     client
@@ -251,7 +251,7 @@ async fn first(
     Ok(())
 }
 
-async fn second(h: JobHandler, job: SecondJob, RekkaData(probe): RekkaData<Probe>) {
+async fn second(job: SecondJob, RekkaData(probe): RekkaData<Probe>, h: JobHandler) {
     probe.record(h.task_id(), h.attempt(), job.value, 0);
 }
 
@@ -289,10 +289,10 @@ struct Reminder {
 
 /// Sem `.data(queues)`: o extractor `RekkaClient` basta para adicionar e remover jobs.
 async fn orchestrate(
-    h: JobHandler,
     job: Orchestrator,
     client: RekkaClient,
     RekkaData(probe): RekkaData<Probe>,
+    h: JobHandler,
 ) -> rekka::Result<()> {
     client.immediate(SecondJob { task_id: format!("{}-next", job.task_id), value: 7 }).await?;
     client.schedule_in(Reminder { task_id: format!("{}-later", job.task_id) }, Duration::from_secs(3600)).await?;

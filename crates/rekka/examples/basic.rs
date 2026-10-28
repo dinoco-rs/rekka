@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use rekka::chrono::Utc;
 use rekka::{
-    Cache, JobEvent, JobHandler, Queues, ReconcileHandler, RekkaCache, RekkaExecutionResult, RekkaQueue, RekkaData,
-    RetryPolicy,
+    Cache, JobEvent, JobHandler, Queues, ReconcileHandler, RekkaCache, RekkaData, RekkaExecutionResult, RekkaQueue,
+    RetryPolicy, StepResult,
 };
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +22,23 @@ pub struct MailJob {
 #[rekka(name = "other")]
 pub struct OtherJob {
     task_id: u64,
+}
+
+/// Entrada do workflow: o fluxo só começa enfileirando este job.
+#[derive(Serialize, Deserialize, RekkaQueue)]
+#[rekka(name = "create_customer")]
+pub struct CreateCustomerJob {
+    task_id: String,
+    name: String,
+    email: String,
+}
+
+/// Passa de um passo do workflow para o próximo (não precisa de `RekkaQueue`).
+#[derive(Serialize, Deserialize)]
+pub struct Customer {
+    id: i64,
+    name: String,
+    email: String,
 }
 
 #[derive(Serialize, Deserialize, RekkaCache)]
@@ -52,6 +69,16 @@ async fn main() -> rekka::Result<()> {
                 .build_fn(execute_mail_job)
         })
         .register::<OtherJob>(|w| w.retry(policy).concurrency(3).build_fn(execute_other_job))
+        // Cada passo é uma fila própria com estas opções; a saída de um passo é a entrada do próximo.
+        .register_workflow::<CreateCustomerJob>(|w| {
+            w.concurrency(4)
+                .retry(RetryPolicy::RetryAfterRange(Duration::from_secs(2), Duration::from_secs(60)))
+                .max_attempts(8)
+                .timeout(Duration::from_secs(30))
+                .start_with(create_customer)
+                .then(validate_customer)
+                .then(send_welcome_email)
+        })
         .register_recursive("reconcile_payments", |w| {
             w.interval(Duration::from_secs(60)).build_fn(reconcile_payments)
         })
@@ -66,6 +93,13 @@ async fn main() -> rekka::Result<()> {
         .await?;
     queues.remove::<MailJob>("mail-2").await?;
     queues.immediate(OtherJob { task_id: 1 }).await?;
+    queues
+        .immediate(CreateCustomerJob {
+            task_id: "customer-1".into(),
+            name: "Ada".into(),
+            email: "ada@example.com".into(),
+        })
+        .await?;
 
     // Cache: standalone (`Cache::new(url).await?`) ou compartilhando a conexão das filas.
     let cache = queues.cache();
@@ -103,11 +137,12 @@ async fn reconcile_function(handler: ReconcileHandler) -> rekka::Result<()> {
     Ok(())
 }
 
+// O job vem sempre primeiro; depois dele, extractors em qualquer ordem (inclusive `JobHandler`).
 async fn execute_mail_job(
-    handler: JobHandler,
     job: MailJob,
     RekkaData(state): RekkaData<MyData>,
     cache: Cache,
+    handler: JobHandler,
 ) -> RekkaExecutionResult {
     // `get` nunca falha: ausente, formato incompatível ou Redis fora do ar viram `None`.
     let business = cache.get::<Business>(job.business_id).await;
@@ -126,8 +161,25 @@ async fn execute_mail_job(
     handler.success()
 }
 
-async fn execute_other_job(_handler: JobHandler, _job: OtherJob) -> Result<(), std::io::Error> {
+async fn execute_other_job(_job: OtherJob) -> Result<(), std::io::Error> {
     Ok(())
+}
+
+/// Primeiro passo do workflow: o `Ok` vira a entrada do próximo passo.
+async fn create_customer(job: CreateCustomerJob) -> Result<Customer, std::io::Error> {
+    Ok(Customer { id: 1, name: job.name, email: job.email })
+}
+
+async fn validate_customer(customer: Customer, handler: JobHandler) -> StepResult<Customer> {
+    if !customer.email.contains('@') {
+        // Encerra a execução: os próximos passos não executam.
+        return handler.cancel().into();
+    }
+    StepResult::Next(customer)
+}
+
+async fn send_welcome_email(customer: Customer, RekkaData(state): RekkaData<MyData>) {
+    println!("welcome {} ({}) <{}>, from {}", customer.name, customer.id, customer.email, state.sender);
 }
 
 async fn reconcile_payments(RekkaData(_state): RekkaData<MyData>) {}

@@ -14,7 +14,7 @@ struct WorkJob {
     sleep_ms: u64,
 }
 
-async fn work(h: JobHandler, job: WorkJob, RekkaData(probe): RekkaData<Probe>, RekkaData(instance): RekkaData<Instance>) {
+async fn work(job: WorkJob, RekkaData(probe): RekkaData<Probe>, RekkaData(instance): RekkaData<Instance>, h: JobHandler) {
     let _running = probe.gauge.enter();
     probe.record(h.task_id(), h.attempt(), 0, instance.0);
     tokio::time::sleep(ms(job.sleep_ms)).await;

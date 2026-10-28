@@ -16,10 +16,10 @@ struct FragileJob {
 }
 
 async fn fragile(
-    h: JobHandler,
     job: FragileJob,
     RekkaData(probe): RekkaData<Probe>,
     RekkaData(instance): RekkaData<Instance>,
+    h: JobHandler,
 ) {
     probe.record(h.task_id(), h.attempt(), 0, instance.0);
     if instance.0 == job.hang_on {
@@ -113,7 +113,7 @@ struct MixedJob {
     sleep_ms: u64,
 }
 
-async fn mixed(h: JobHandler, job: MixedJob, RekkaData(probe): RekkaData<Probe>) {
+async fn mixed(job: MixedJob, RekkaData(probe): RekkaData<Probe>, h: JobHandler) {
     if job.sleep_ms > 0 {
         probe.record(h.task_id(), h.attempt(), 0, 0);
         tokio::time::sleep(ms(job.sleep_ms)).await;

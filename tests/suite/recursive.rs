@@ -115,7 +115,7 @@ async fn enqueue_report(client: RekkaClient, RekkaData(counter): RekkaData<Atomi
     Ok(())
 }
 
-async fn report(h: JobHandler, _job: ReportJob, RekkaData(probe): RekkaData<Probe>) {
+async fn report(_job: ReportJob, RekkaData(probe): RekkaData<Probe>, h: JobHandler) {
     probe.record(h.task_id(), h.attempt(), 0, 0);
 }
 

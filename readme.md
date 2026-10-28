@@ -33,6 +33,7 @@ Be part of this journey, help accelerate the development of the Dinoco ecosystem
 - **Typed jobs:** derive `RekkaQueue` on a serde struct. Its `task_id` makes every enqueue an upsert, so a job is never duplicated.
 - **Retries and scheduling:** run now, at an instant, or after a delay. Retry policies, attempt limits, and timeouts are set per queue, and panics are caught.
 - **Safe horizontal scaling:** jobs are leased and heartbeated. If a process dies, its jobs return to the queue, and per-key concurrency holds across every instance.
+- **Workflows:** chain handlers with `start_with(create_customer).then(validate_customer).then(send_email)`. Each step is its own queue with retries, timeouts, and concurrency, its output is the next step's input, and moving from one step to the next is a single atomic Redis script.
 - **Recurring workers and reconcile:** tasks run on an interval or a cron expression (`cron_time("*/2 * * * *")`, with optional seconds), on exactly one instance per cycle, and a reconcile hook on the same shared schedule restores jobs from your own source of truth, starting its next run only after the previous one ends.
 - **Typed cache:** derive `RekkaCache` with a TTL and a key, either a field or a template such as `"session:{session_id}"`, then `cache.get::<Session>(42)` with just the field value. Reads never fail: a miss or an unreachable Redis is `None`.
 - **Survives Redis outages:** while Redis is down, enqueued jobs are kept in a local file and sent, in order, once it returns, and no call hangs. Queues, recurring workers, and the cache resume on their own, and reconcile runs once as soon as Redis is back, even after a failover or a restart that lost the data.
@@ -44,7 +45,7 @@ Add Rekka to your `Cargo.toml` dependencies:
 
 ```toml
 [dependencies]
-rekka = "0.0.5"
+rekka = "0.0.6"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -78,11 +79,12 @@ struct Mailer {
     from: String,
 }
 
+// The job comes first; extractors such as `JobHandler`, `RekkaData<T>` and `Cache` follow in any order.
 async fn send_email(
-    handler: JobHandler,
     job: SendEmail,
     RekkaData(mailer): RekkaData<Mailer>,
     cache: Cache,
+    handler: JobHandler,
 ) -> RekkaExecutionResult {
     let Some(user) = cache.get::<User>(job.user_id).await else {
         return handler.cancel();
@@ -112,7 +114,7 @@ async fn main() -> rekka::Result<()> {
 }
 ```
 
-A longer example covering reconcile, recurring workers, events, and the cache lives in [`crates/rekka/examples/basic.rs`](./crates/rekka/examples/basic.rs):
+A longer example covering workflows, reconcile, recurring workers, events, and the cache lives in [`crates/rekka/examples/basic.rs`](./crates/rekka/examples/basic.rs):
 
 ```bash
 REDIS_URL=redis://127.0.0.1:6379 cargo run -p rekka --example basic
@@ -125,6 +127,7 @@ The full guide lives at [dinoco.io/docs/rekka](https://dinoco.io/docs/rekka), in
 - [Quickstart](https://dinoco.io/en-us/docs/rekka/guide/quickstart) — from an empty crate to a running worker.
 - [Jobs and enqueueing](https://dinoco.io/en-us/docs/rekka/queues/jobs) — `task_id`, upserts, and scheduling.
 - [Workers](https://dinoco.io/en-us/docs/rekka/queues/workers) — handlers, extractors, and worker options.
+- [Workflows](https://dinoco.io/en-us/docs/rekka/queues/workflows) — steps that pass their output to the next one.
 - [Typed cache](https://dinoco.io/en-us/docs/rekka/cache/cache-types) — keys, TTLs, and batch operations.
 - [Reliability](https://dinoco.io/en-us/docs/rekka/operations/reliability) — leases, recovery, and what Rekka stores in Redis.
 

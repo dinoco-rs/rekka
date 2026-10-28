@@ -19,7 +19,7 @@ fn mail(id: &str, value: i64) -> MailJob {
     MailJob { task_id: id.into(), value }
 }
 
-async fn record(h: JobHandler, job: MailJob, RekkaData(probe): RekkaData<Probe>) {
+async fn record(job: MailJob, RekkaData(probe): RekkaData<Probe>, h: JobHandler) {
     probe.record(h.task_id(), h.attempt(), job.value, 0);
 }
 
@@ -139,7 +139,7 @@ struct Gate {
     release: Notify,
 }
 
-async fn gated(h: JobHandler, job: MailJob, RekkaData(probe): RekkaData<Probe>, RekkaData(gate): RekkaData<Gate>) {
+async fn gated(job: MailJob, RekkaData(probe): RekkaData<Probe>, RekkaData(gate): RekkaData<Gate>, h: JobHandler) {
     let _running = probe.gauge.enter();
     probe.record(h.task_id(), h.attempt(), job.value, 0);
     if job.value == 1 {
@@ -181,7 +181,7 @@ async fn enqueue_while_running_runs_after_current_and_never_in_parallel() {
     q.shutdown().await.unwrap();
 }
 
-async fn fail_slowly(h: JobHandler, job: MailJob, RekkaData(probe): RekkaData<Probe>, RekkaData(gate): RekkaData<Gate>) -> Result<(), String> {
+async fn fail_slowly(job: MailJob, RekkaData(probe): RekkaData<Probe>, RekkaData(gate): RekkaData<Gate>, h: JobHandler) -> Result<(), String> {
     probe.record(h.task_id(), h.attempt(), job.value, 0);
     gate.started.notify_one();
     gate.release.notified().await;

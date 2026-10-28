@@ -15,7 +15,7 @@ struct SlowJob {
     hang_on: u32,
 }
 
-async fn slow(h: JobHandler, job: SlowJob, RekkaData(probe): RekkaData<Probe>, RekkaData(instance): RekkaData<Instance>) {
+async fn slow(job: SlowJob, RekkaData(probe): RekkaData<Probe>, RekkaData(instance): RekkaData<Instance>, h: JobHandler) {
     probe.record(h.task_id(), h.attempt(), 0, instance.0);
     if instance.0 == job.hang_on {
         std::future::pending::<()>().await;

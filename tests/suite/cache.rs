@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use rekka::{Cache, JobHandler, RekkaCache, RekkaError, RekkaQueue};
+use rekka::{Cache, RekkaCache, RekkaError, RekkaQueue};
 use serde::{Deserialize, Serialize};
 
 use crate::common::{TestEnv, eventually_async, ms};
@@ -371,7 +371,7 @@ struct WarmJob {
 }
 
 /// O cache também é um extractor e compartilha a conexão das filas.
-async fn warm(_h: JobHandler, job: WarmJob, cache: Cache) -> rekka::Result<()> {
+async fn warm(job: WarmJob, cache: Cache) -> rekka::Result<()> {
     cache.insert(&user(job.task_id)).await
 }
 

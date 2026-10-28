@@ -7,21 +7,22 @@
 //! `RUSTC_BOOTSTRAP=1 cargo rustc --test future_sizes -- -Zprint-type-sizes`.
 
 use rekka::__private::{JobFutureSizes, TaskFutureSizes, job_future_sizes, task_future_sizes};
-use rekka::{JobHandler, RekkaQueue};
+use rekka::RekkaQueue;
 use serde::{Deserialize, Serialize};
 
 /// Orçamentos em bytes, ~20% acima do medido em 2026-10-25 (rustc 1.95, tokio 1.53, redis 1.7),
-/// iguais em debug e release.
+/// iguais em debug e release. Os valores medidos abaixo são do 0.0.6 (2026-10-28), depois de
+/// `JobHandler` virar extractor e dos passos de workflow (`Outcome` no lugar do resultado).
 mod budget {
-    /// Medido: 1056.
+    /// Medido: 1040.
     pub const RUN_JOB: usize = 1280;
-    /// Medido: 136.
+    /// Medido: 144 (o ponteiro de conversão da saída).
     pub const EXECUTE: usize = 192;
-    /// Medido: 728.
+    /// Medido: 712.
     pub const FINALIZE: usize = 896;
-    /// Medido: 976.
+    /// Medido: 984.
     pub const QUEUE_LOOP: usize = 1152;
-    /// Medido: 1200.
+    /// Medido: 1208.
     pub const QUEUE_SUPERVISE: usize = 1408;
     /// Medido: 840.
     pub const RUN: usize = 1024;
@@ -37,10 +38,10 @@ struct SizeJob {
     task_id: u32,
 }
 
-async fn minimal(_h: JobHandler, _job: SizeJob) {}
+async fn minimal(_job: SizeJob) {}
 
 /// Mantém `N` bytes vivos através de um `.await`: o future do handler tem pelo menos `N` bytes.
-async fn holds<const N: usize>(_h: JobHandler, _job: SizeJob) -> Result<(), String> {
+async fn holds<const N: usize>(_job: SizeJob) -> Result<(), String> {
     let buf = [0u8; N];
     tokio::task::yield_now().await;
     std::hint::black_box(&buf);

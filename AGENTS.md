@@ -11,15 +11,16 @@ Rekka is a Rust library for Redis-backed job queues and a typed cache, built to 
 │   ├── rekka/              Public crate
 │   │   ├── src/
 │   │   │   ├── runtime.rs  QueuesBuilder (configuration, validation, start) and Queues (running handle)
-│   │   │   ├── worker.rs   RekkaWorker options and the queue loop: claim, heartbeat, reaper, finalize
+│   │   │   ├── worker.rs   RekkaWorker options and the queue loop: claim, heartbeat, reaper, finalize (shared by queues and workflow steps)
+│   │   │   ├── workflow.rs register_workflow steps (`start_with`/`then`), StepResult, IntoStepResult; each step is a queue under the entry queue's hash tag
 │   │   │   ├── recursive.rs Recurring workers (`interval` or `cron_time`) and reconcile (one instance per cycle via a Redis lock; reconcile counts its interval from the end of the previous run)
 │   │   │   ├── cron.rs     Cron expression parser (node-cron format, optional seconds) and next-occurrence search
 │   │   │   ├── client.rs   RekkaClient (enqueue, remove, state, stats, purge), ReconcileHandler
 │   │   │   ├── conn.rs     RedisConn: the shared connection (fails fast while Redis is down, replaces silent connections, signals recoveries)
 │   │   │   ├── buffer.rs   Offline buffer: enqueues made while Redis is down go to `<buffer_dir>/<prefix>.<n>.jsonl` and are sent in order
 │   │   │   ├── job.rs      RekkaQueue, JobHandler, RetryPolicy, RekkaExecutionResult
-│   │   │   ├── handler.rs  JobFn / TaskFn: handlers with up to 8 extractors; `call` boxes the handler future; FutureSize
-│   │   │   ├── context.rs  FromContext, RekkaContext, RekkaData
+│   │   │   ├── handler.rs  JobFn / TaskFn: the job first, then up to 8 extractors; `call` boxes the handler future; FutureSize
+│   │   │   ├── context.rs  FromContext, RekkaContext, RekkaData; extractor impls for JobHandler and RekkaClient
 │   │   │   ├── cache.rs    Cache, CacheBuilder, RekkaCache
 │   │   │   ├── event.rs    JobEvent, JobEventKind, EventSource
 │   │   │   ├── scripts.rs  Every Lua script plus the Redis data model of a queue (read its header)
@@ -40,7 +41,8 @@ Rekka is a Rust library for Redis-backed job queues and a typed cache, built to 
 
 - Code comments and rustdoc are written in Portuguese; READMEs and the public documentation are written in English and Portuguese.
 - Every state change on a queue happens inside a Lua script in `scripts.rs`, using the Redis clock (`TIME`). Keep it that way: no read-modify-write from Rust.
-- All keys of a queue share the `{queue}` hash tag. Recurring workers use `{rec:<name>}`.
+- All keys of a queue share the `{queue}` hash tag. Recurring workers use `{rec:<name>}`. Workflow step `n` lives under `prefix:{entry}:n:`, in the entry queue's slot, so `ADVANCE` completes one step and enqueues the next in one script.
+- `JobHandler` is an extractor like any other (`FromContext`): handlers get the job first and only declare what they use. New per-run data goes into `JobHandler`/`RekkaContext::job`, not into the handler signature.
 - Configuration errors are caught in `QueuesBuilder::check` and extractor validation in `start()`, so a misconfigured service fails at boot, not on the first job.
 
 ## Tests

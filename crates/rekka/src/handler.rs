@@ -5,29 +5,42 @@ use std::pin::Pin;
 use crate::context::{FromContext, RekkaContext};
 use crate::error::Result;
 use crate::event::EventSource;
-use crate::job::{IntoExecutionResult, JobHandler, RekkaQueue};
 
 /// Limite padrão do tamanho do future de um handler (`max_future_size`).
 pub(crate) const DEFAULT_MAX_FUTURE_SIZE: usize = 16 * 1024;
 
-/// Handler de job: `async fn(JobHandler, J, E1, ..., En) -> impl IntoExecutionResult`,
-/// onde cada `Ei` implementa [`FromContext`] (ex.: `RekkaData<T>`, `RekkaClient`).
+/// Handler de job: `async fn(J, E1, ..., En) -> R`. O job vem sempre primeiro; cada `Ei`
+/// implementa [`FromContext`] (ex.: `JobHandler`, `RekkaData<T>`, `RekkaClient`). Numa fila, `R`
+/// implementa [`IntoExecutionResult`](crate::IntoExecutionResult); num passo de workflow,
+/// [`IntoStepResult`](crate::IntoStepResult).
 ///
 /// O future do handler tem o tamanho que o handler pedir (tudo o que fica vivo através de um
 /// `.await`). `call` o boxeia uma única vez, na fronteira: os futures internos do rekka guardam
 /// só o ponteiro e têm tamanho constante. `Future` é o tipo do handler, medido no registro
 /// contra `max_future_size`.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a handler for `{J}`",
+    label = "expected `async fn(job: {J}, extractors...)`",
+    note = "the job is always the first argument; `JobHandler` and the other extractors (types implementing \
+            `FromContext`, up to 8) come after it"
+)]
 pub trait JobFn<J, M>: Send + Sync + 'static {
-    type Output: IntoExecutionResult;
+    type Output;
     type Future: Future<Output = Self::Output> + Send + 'static;
 
-    fn call(&self, handler: JobHandler, job: J, cx: &RekkaContext) -> Result<Pin<Box<Self::Future>>>;
+    fn call(&self, job: J, cx: &RekkaContext) -> Result<Pin<Box<Self::Future>>>;
 
     fn validate(cx: &RekkaContext) -> Result<()>;
 }
 
 /// Handler de worker recorrente e de reconcile: `async fn(E1, ..., En) -> impl IntoTaskResult`.
 /// O future é boxeado em `call`, como em [`JobFn`].
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a recurring worker or reconcile handler",
+    label = "expected `async fn(extractors...)`",
+    note = "recurring workers and reconcile functions only take extractors (types implementing `FromContext`, \
+            up to 8), and return `()` or `Result<(), E: Display>`"
+)]
 pub trait TaskFn<M>: Send + Sync + 'static {
     type Output: IntoTaskResult;
     type Future: Future<Output = Self::Output> + Send + 'static;
@@ -86,6 +99,10 @@ impl FutureSize {
 }
 
 /// Retornos aceitos por [`TaskFn`]: `()` ou `Result<(), E: Display>`.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a valid return type for a recurring worker or reconcile handler",
+    note = "return `()` or `Result<(), E>` where `E: Display`"
+)]
 pub trait IntoTaskResult {
     fn into_task_result(self) -> Result<(), String>;
 }
@@ -108,10 +125,8 @@ macro_rules! impl_handlers {
     ($($E:ident),*) => {
         impl<F, Fut, J, $($E,)*> JobFn<J, ($($E,)*)> for F
         where
-            F: Fn(JobHandler, J, $($E,)*) -> Fut + Send + Sync + 'static,
+            F: Fn(J, $($E,)*) -> Fut + Send + Sync + 'static,
             Fut: Future + Send + 'static,
-            Fut::Output: IntoExecutionResult,
-            J: RekkaQueue,
             $($E: FromContext,)*
         {
             type Output = Fut::Output;
@@ -119,9 +134,9 @@ macro_rules! impl_handlers {
 
             #[inline]
             #[allow(non_snake_case, unused_variables)]
-            fn call(&self, handler: JobHandler, job: J, cx: &RekkaContext) -> Result<Pin<Box<Fut>>> {
+            fn call(&self, job: J, cx: &RekkaContext) -> Result<Pin<Box<Fut>>> {
                 $(let $E = $E::from_context(cx)?;)*
-                Ok(Box::pin((self)(handler, job, $($E,)*)))
+                Ok(Box::pin((self)(job, $($E,)*)))
             }
 
             #[allow(unused_variables)]

@@ -61,7 +61,8 @@ pub enum RekkaExecutionResult {
     RetryAfter(Duration),
 }
 
-/// Contexto da execução atual, recebido como primeiro argumento do handler.
+/// Contexto da execução atual. É um extractor: declare um argumento `JobHandler` depois do job,
+/// em qualquer posição, só quando o handler precisar dele.
 #[derive(Debug, Clone)]
 pub struct JobHandler {
     pub(crate) queue: &'static str,
@@ -72,6 +73,7 @@ pub struct JobHandler {
 }
 
 impl JobHandler {
+    /// Nome da fila; num passo de workflow, `<fila de entrada>.<passo>`.
     pub fn queue(&self) -> &'static str {
         self.queue
     }
@@ -120,6 +122,11 @@ impl JobHandler {
 /// - [`RekkaExecutionResult`]
 /// - `()` (equivale a sucesso)
 /// - `Result<T, E>` com `T: IntoExecutionResult` e `E: Display` (`Err` aplica o retry)
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a valid return type for a job handler",
+    note = "return `()`, `RekkaExecutionResult` or `Result<T, E>` where `T` is one of these and `E: Display`; \
+            to pass a value to the next step, register the handler as a workflow step"
+)]
 pub trait IntoExecutionResult {
     fn into_execution_result(self) -> RekkaExecutionResult;
 }

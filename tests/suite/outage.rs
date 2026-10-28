@@ -127,7 +127,7 @@ struct Ticks {
 }
 
 /// Registra `sleep_ms` como valor, para os testes distinguirem versões do mesmo job.
-async fn work(h: JobHandler, job: OutageJob, RekkaData(probe): RekkaData<Probe>) {
+async fn work(job: OutageJob, RekkaData(probe): RekkaData<Probe>, h: JobHandler) {
     probe.record(h.task_id(), h.attempt(), job.sleep_ms as i64, 0);
     tokio::time::sleep(ms(job.sleep_ms)).await;
 }

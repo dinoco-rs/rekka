@@ -19,10 +19,10 @@ struct FlakyJob {
 struct LastAttemptSeen(AtomicBool);
 
 async fn flaky(
-    h: JobHandler,
     job: FlakyJob,
     RekkaData(probe): RekkaData<Probe>,
     RekkaData(seen): RekkaData<LastAttemptSeen>,
+    h: JobHandler,
 ) -> Result<(), String> {
     probe.record(h.task_id(), h.attempt(), i64::from(h.is_last_attempt()), 0);
     if h.is_last_attempt() {

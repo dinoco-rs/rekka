@@ -14,7 +14,7 @@ use tracing::{debug, info};
 
 use crate::client::RekkaClient;
 use crate::error::Result;
-use crate::keys::{QueueKeys, validate_name};
+use crate::keys::{QueueAddr, QueueKeys, validate_name};
 use crate::scripts;
 use crate::util::{delete_matching, glob_escape};
 
@@ -30,9 +30,11 @@ struct Report {
     removed: u64,
 }
 
-pub(crate) async fn run(client: RekkaClient, queues: Arc<[&'static str]>) -> Result<()> {
+pub(crate) async fn run(client: RekkaClient, queues: Arc<[QueueAddr]>) -> Result<()> {
     let prefix = &client.shared.prefix;
-    let registered: HashMap<&str, QueueKeys> = queues.iter().map(|name| (*name, QueueKeys::new(prefix, name))).collect();
+    // (fila de entrada, passo) -> chaves; filas comuns são o passo 0.
+    let registered: HashMap<(&str, usize), QueueKeys> =
+        queues.iter().map(|addr| ((addr.root, addr.step), addr.keys(prefix))).collect();
     let mut conn = client.conn();
     let mut report = Report::default();
 
@@ -49,11 +51,13 @@ pub(crate) async fn run(client: RekkaClient, queues: Arc<[&'static str]>) -> Res
             .query_async(&mut conn)
             .await?;
 
-        let mut jobs: HashMap<&str, Vec<&str>> = HashMap::new();
-        let mut groups: HashMap<&str, Vec<&str>> = HashMap::new();
+        let mut jobs: HashMap<(&str, usize), Vec<&str>> = HashMap::new();
+        let mut groups: HashMap<(&str, usize), Vec<&str>> = HashMap::new();
         for key in &found {
-            let Some((queue, rest)) = split_queue_key(prefix, key) else { continue };
-            if !registered.contains_key(queue) {
+            let Some((root, rest)) = split_queue_key(prefix, key) else { continue };
+            let (step, rest) = split_step(rest);
+            let queue = (root, step);
+            if !registered.contains_key(&queue) {
                 // Filas de outros serviços: não sabemos se estão abandonadas, então não mexemos.
                 continue;
             }
@@ -64,7 +68,7 @@ pub(crate) async fn run(client: RekkaClient, queues: Arc<[&'static str]>) -> Res
             }
         }
         for (queue, ids) in jobs {
-            let mut inv = registered[queue].invocation(&scripts::JANITOR_JOBS_SCRIPT);
+            let mut inv = registered[&queue].invocation(&scripts::JANITOR_JOBS_SCRIPT);
             for id in ids {
                 inv.arg(id);
             }
@@ -73,7 +77,7 @@ pub(crate) async fn run(client: RekkaClient, queues: Arc<[&'static str]>) -> Res
             report.removed += removed;
         }
         for (queue, ks) in groups {
-            let mut inv = registered[queue].invocation(&scripts::JANITOR_GROUPS_SCRIPT);
+            let mut inv = registered[&queue].invocation(&scripts::JANITOR_GROUPS_SCRIPT);
             for k in ks {
                 inv.arg(k);
             }
@@ -120,18 +124,29 @@ fn split_queue_key<'a>(prefix: &str, key: &'a str) -> Option<(&'a str, &'a str)>
     Some((&rest[..end], rest[end + 1..].strip_prefix(':')?))
 }
 
-/// Apaga todos os dados de uma fila. Retorna quantos jobs existiam.
+/// Resto de uma chave de fila -> `(passo, resto)`: `3:j:id` é do passo 3 de um workflow, o resto
+/// é da fila de entrada (passo 0). As chaves da fila de entrada nunca começam com dígito.
+fn split_step(rest: &str) -> (usize, &str) {
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    match (rest[..digits].parse(), rest[digits..].strip_prefix(':')) {
+        (Ok(step), Some(rest)) if step > 0 => (step, rest),
+        _ => (0, rest),
+    }
+}
+
+/// Apaga todos os dados de uma fila e, se ela é a entrada de um workflow, dos outros passos (que
+/// ficam sob a mesma base). Retorna quantos jobs existiam.
 pub(crate) async fn purge(client: &RekkaClient, queue: &str) -> Result<u64> {
     validate_name("queue", queue).map_err(crate::RekkaError::InvalidConfig)?;
     let keys = QueueKeys::new(&client.shared.prefix, queue);
     let pattern = format!("{}*", glob_escape(&keys.base));
-    let jobs_prefix = format!("{}j:", keys.base);
-    delete_matching(&mut client.conn(), &pattern, |key| key.starts_with(&jobs_prefix)).await
+    let is_job = |key: &str| key.strip_prefix(keys.base.as_str()).is_some_and(|rest| split_step(rest).1.starts_with("j:"));
+    delete_matching(&mut client.conn(), &pattern, is_job).await
 }
 
 #[cfg(test)]
 mod tests {
-    use super::split_queue_key;
+    use super::{split_queue_key, split_step};
 
     #[test]
     fn splits_queue_keys() {
@@ -139,5 +154,15 @@ mod tests {
         assert_eq!(split_queue_key("rekka", "rekka:{mail}:queue"), Some(("mail", "queue")));
         assert_eq!(split_queue_key("rekka", "rekka:cache:x"), None);
         assert_eq!(split_queue_key("rekka", "other:{mail}:queue"), None);
+    }
+
+    #[test]
+    fn splits_workflow_steps() {
+        assert_eq!(split_step("j:a"), (0, "j:a"));
+        assert_eq!(split_step("queue"), (0, "queue"));
+        assert_eq!(split_step("2:j:a"), (2, "j:a"));
+        assert_eq!(split_step("12:queue"), (12, "queue"));
+        assert_eq!(split_step("0:j:a"), (0, "0:j:a"));
+        assert_eq!(split_step("2"), (0, "2"));
     }
 }

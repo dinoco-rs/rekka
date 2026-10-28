@@ -21,10 +21,10 @@ fn mail(id: &str, business_id: i64, sleep_ms: u64) -> MailJob {
 }
 
 async fn send(
-    h: JobHandler,
     job: MailJob,
     RekkaData(probe): RekkaData<Probe>,
     RekkaData(instance): RekkaData<Instance>,
+    h: JobHandler,
 ) -> Result<(), String> {
     let _total = probe.gauge.enter();
     let _key = probe.keys.enter(job.business_id.to_string());

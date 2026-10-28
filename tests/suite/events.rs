@@ -20,7 +20,7 @@ struct OtherJob {
     task_id: String,
 }
 
-async fn send(h: JobHandler, _job: MailJob, RekkaData(probe): RekkaData<Probe>) {
+async fn send(_job: MailJob, RekkaData(probe): RekkaData<Probe>, h: JobHandler) {
     probe.record(h.task_id(), h.attempt(), 0, 0);
 }
 

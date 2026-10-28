@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use rekka::{JobHandler, RekkaData, RekkaQueue};
+use rekka::{IntoExecutionResult, RekkaData, RekkaQueue};
 use serde::{Deserialize, Serialize};
 
 use common::{TestEnv, eventually};
@@ -28,7 +28,7 @@ struct StackJob {
     task_id: u32,
 }
 
-async fn holds<const N: usize>(_h: JobHandler, _job: StackJob, RekkaData(done): RekkaData<AtomicUsize>) {
+async fn holds<const N: usize>(_job: StackJob, RekkaData(done): RekkaData<AtomicUsize>) {
     let buf = [0u8; N];
     tokio::task::yield_now().await;
     std::hint::black_box(&buf);
@@ -57,6 +57,7 @@ fn on_small_stack<Fut: Future<Output = ()> + Send + 'static>(stack: usize, test:
 async fn run_queue<F, M>(handler: F)
 where
     F: rekka::JobFn<StackJob, M>,
+    F::Output: IntoExecutionResult,
     M: 'static,
 {
     let env = TestEnv::new();

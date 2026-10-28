@@ -221,6 +221,7 @@ impl RekkaClient {
 
     /// Remove a fila inteira (aguardando, agendados, bloqueados e o estado dos que estão
     /// executando — esses terminam, mas o resultado é ignorado). Retorna quantos jobs existiam.
+    /// Com o job de entrada de um workflow, remove todos os passos dele.
     pub async fn purge<J: RekkaQueue>(&self) -> Result<u64> {
         crate::janitor::purge(self, J::NAME).await
     }

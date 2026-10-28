@@ -19,6 +19,7 @@ mod runtime;
 mod scripts;
 mod util;
 mod worker;
+mod workflow;
 
 pub use cache::{Cache, CacheBuilder, RekkaCache};
 pub use client::{Enqueued, JobState, QueueStats, ReconcileHandler, RekkaClient, Removed};
@@ -31,6 +32,7 @@ pub use recursive::{RecursiveWorker, RekkaRecursiveWorker};
 pub use rekka_derives::{RekkaCache, RekkaQueue};
 pub use runtime::{Queues, QueuesBuilder};
 pub use worker::{RekkaWorker, Worker};
+pub use workflow::{BuildWorkflow, IntoStepResult, StepResult, Workflow};
 
 pub use chrono;
 

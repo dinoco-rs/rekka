@@ -38,7 +38,7 @@ async fn reconcile(handler: ReconcileHandler, RekkaData(db): RekkaData<Db>) -> r
     Ok(())
 }
 
-async fn process(h: JobHandler, job: InvoiceJob, RekkaData(probe): RekkaData<Probe>) {
+async fn process(job: InvoiceJob, RekkaData(probe): RekkaData<Probe>, h: JobHandler) {
     probe.record(h.task_id(), h.attempt(), 0, 0);
     tokio::time::sleep(ms(job.sleep_ms)).await;
 }

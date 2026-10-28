@@ -21,14 +21,15 @@ use crate::client::{Enqueued, JobState, QueueStats, RekkaClient, Removed, Shared
 use crate::conn::RedisConn;
 use crate::context::{DataMap, RekkaContext};
 use crate::error::{RekkaError, Result};
-use crate::event::{EventHandler, JobEvent};
+use crate::event::{EventHandler, EventSource, JobEvent};
 use crate::handler::{DEFAULT_MAX_FUTURE_SIZE, FutureSize, TaskFn};
 use crate::job::{RekkaQueue, ToTaskId};
-use crate::keys::{QueueKeys, validate_name};
+use crate::keys::{QueueAddr, validate_name};
 use crate::recursive::{ErasedRecursive, RecursiveEnv, RecursiveWorker, RekkaRecursiveWorker};
 use crate::scripts;
 use crate::util::{Backoff, millis, stable_hash, supervise};
 use crate::worker::{ErasedWorker, LoopEnv, RekkaWorker, Worker};
+use crate::workflow::BuildWorkflow;
 
 /// Configuração das filas. Criado com [`Queues::new`] e iniciado com [`QueuesBuilder::start`].
 pub struct QueuesBuilder {
@@ -106,6 +107,35 @@ impl QueuesBuilder {
             self.key_fns.insert(TypeId::of::<J>(), Box::new(key_fn));
         }
         self.workers.push(worker.runner);
+        self
+    }
+
+    /// Registra um workflow: uma sequência de passos em que a saída de cada um é a entrada do
+    /// próximo. Cada passo é uma fila própria, com as opções configuradas no `RekkaWorker` (retry,
+    /// tentativas, timeout, concorrência...), e o workflow só começa pela fila de `J`, o job do
+    /// primeiro passo: enfileire um `J` com `immediate`, `schedule` ou o reconcile, como em
+    /// qualquer fila.
+    ///
+    /// ```ignore
+    /// .register_workflow::<CreateCustomer>(|w| {
+    ///     w.max_attempts(8)
+    ///         .concurrency_by_key(|job| job.account_id)
+    ///         .start_with(create_customer) // async fn(CreateCustomer, ...) -> Result<Customer, E>
+    ///         .then(validate_customer) // async fn(Customer, ...) -> Result<Customer, E>
+    ///         .then(send_welcome_email) // async fn(Customer, ...) -> Result<(), E>
+    /// })
+    /// ```
+    ///
+    /// O handler de `start_with` recebe um `J` como primeiro argumento. Sem o `::<J>`, `J` vem
+    /// desse handler, mas aí o closure do `concurrency_by_key` precisa do tipo anotado. O passo `n`
+    /// (a partir de 1) roda na fila `<J::NAME>.<n>`, com o mesmo `task_id` do job de entrada. Os
+    /// passos são identificados pela posição: com execuções em andamento, acrescente passos só no fim.
+    pub fn register_workflow<J: RekkaQueue>(mut self, build: impl BuildWorkflow<J>) -> Self {
+        let (key_fn, workers) = build(RekkaWorker::new()).into_parts();
+        if let Some(key_fn) = key_fn {
+            self.key_fns.insert(TypeId::of::<J>(), Box::new(key_fn));
+        }
+        self.workers.extend(workers);
         self
     }
 
@@ -241,12 +271,14 @@ impl QueuesBuilder {
         warn_oversized(&future_sizes);
 
         if !self.workers.is_empty() && !self.cleanup_interval.is_zero() {
-            let mut names: Vec<&'static str> = self.workers.iter().map(|w| w.name()).collect();
-            names.sort_unstable();
+            let mut queues: Vec<(&'static str, QueueAddr)> =
+                self.workers.iter().map(|w| (w.name(), w.addr())).collect();
+            queues.sort_unstable_by_key(|(name, _)| *name);
+            let names: Vec<&str> = queues.iter().map(|(name, _)| *name).collect();
             let key_name = format!("__janitor_{:016x}", stable_hash(&names));
-            let names: Arc<[&'static str]> = names.into();
+            let queues: Arc<[QueueAddr]> = queues.into_iter().map(|(_, addr)| addr).collect();
             let janitor = RecursiveWorker::internal("janitor", key_name, self.cleanup_interval, move |client: RekkaClient| {
-                crate::janitor::run(client, Arc::clone(&names))
+                crate::janitor::run(client, Arc::clone(&queues))
             });
             self.recursive.push(janitor.runner);
         }
@@ -274,7 +306,7 @@ impl QueuesBuilder {
             completed_ttl_ms: millis(self.completed_ttl),
             buffer,
         });
-        let cx = RekkaContext { client: RekkaClient { shared: Arc::clone(&shared) } };
+        let cx = RekkaContext::new(RekkaClient { shared: Arc::clone(&shared) }, EventSource::Queue);
         for w in &self.workers {
             w.validate(&cx)?;
         }
@@ -290,9 +322,9 @@ impl QueuesBuilder {
         let mut channels = HashMap::with_capacity(self.workers.len());
         for worker in self.workers {
             let wake = Arc::new(Notify::new());
-            channels.insert(QueueKeys::new(&shared.prefix, worker.name()).notify_channel(), Arc::clone(&wake));
+            channels.insert(worker.addr().keys(&shared.prefix).notify_channel(), Arc::clone(&wake));
             let env = LoopEnv {
-                cx: cx.clone(),
+                client: cx.client.clone(),
                 token: token.clone(),
                 wake,
                 poll_interval: self.poll_interval,
@@ -313,7 +345,11 @@ impl QueuesBuilder {
             aborts.push(tracker.spawn(listener).abort_handle());
         }
         for recursive in self.recursive {
-            let env = RecursiveEnv { cx: cx.clone(), token: token.clone(), shutdown_timeout: self.shutdown_timeout };
+            let env = RecursiveEnv {
+                client: cx.client.clone(),
+                token: token.clone(),
+                shutdown_timeout: self.shutdown_timeout,
+            };
             aborts.push(tracker.spawn(recursive.into_future(env)).abort_handle());
         }
         if let Some(buffer) = &shared.buffer {

@@ -13,14 +13,16 @@ struct CfgJob {
 
 struct NotRegistered;
 
-async fn needs_data(_h: JobHandler, _job: CfgJob, _state: RekkaData<NotRegistered>) {}
+async fn needs_data(_job: CfgJob, _state: RekkaData<NotRegistered>) {}
 
-async fn noop(_h: JobHandler, _job: CfgJob) {}
+async fn noop(_job: CfgJob) {}
 
 async fn task_needs_data(_state: RekkaData<NotRegistered>) {}
 
+async fn task_with_job_handler(_h: JobHandler) {}
+
 /// Mantém 32 KiB vivos através de um `.await`: passa do `max_future_size` padrão (16 KiB).
-async fn heavy(_h: JobHandler, _job: CfgJob) {
+async fn heavy(_job: CfgJob) {
     let buf = [0u8; 32 * 1024];
     tokio::task::yield_now().await;
     std::hint::black_box(&buf);
@@ -45,6 +47,17 @@ async fn missing_data_fails_at_start() {
     assert!(matches!(res, Err(RekkaError::MissingData(_))));
 }
 
+/// `JobHandler` descreve a execução de um job: num worker recorrente ou no reconcile, o `start()` falha.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn job_handler_outside_a_job_fails_at_start() {
+    let env = TestEnv::new();
+    let rejected =
+        |res: rekka::Result<Queues>| matches!(res, Err(RekkaError::InvalidConfig(msg)) if msg.contains("JobHandler"));
+
+    assert!(rejected(env.builder().register_recursive("t", |w| w.build_fn(task_with_job_handler)).start().await));
+    assert!(rejected(env.builder().with_reconcile(task_with_job_handler, Duration::from_secs(1)).start().await));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invalid_configuration_is_rejected() {
     let env = TestEnv::new();
@@ -52,6 +65,9 @@ async fn invalid_configuration_is_rejected() {
 
     let dup = env.builder().register::<CfgJob>(|w| w.build_fn(noop)).register::<CfgJob>(|w| w.build_fn(noop));
     assert!(invalid(dup.start().await), "duplicate queue");
+    let dup = env.builder().register::<CfgJob>(|w| w.build_fn(noop)).register_workflow(|w| w.start_with(noop));
+    assert!(invalid(dup.start().await), "queue registered again as a workflow entry");
+    assert!(invalid(env.builder().register_workflow(|w| w.concurrency(0).start_with(noop)).start().await));
 
     assert!(invalid(env.builder().register::<CfgJob>(|w| w.concurrency(0).build_fn(noop)).start().await));
     assert!(invalid(env.builder().register::<CfgJob>(|w| w.max_attempts(0).build_fn(noop)).start().await));

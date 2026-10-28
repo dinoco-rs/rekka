@@ -10,6 +10,7 @@ use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep, sleep_until};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
+use crate::client::RekkaClient;
 use crate::context::RekkaContext;
 use crate::cron::CronTime;
 use crate::error::Result;
@@ -212,7 +213,7 @@ impl RecursiveWorker {
 
 #[derive(Clone)]
 pub(crate) struct RecursiveEnv {
-    pub(crate) cx: RekkaContext,
+    pub(crate) client: RekkaClient,
     pub(crate) token: CancellationToken,
     pub(crate) shutdown_timeout: Option<Duration>,
 }
@@ -257,7 +258,7 @@ where
     }
 
     fn validate(&self, cx: &RekkaContext) -> Result<()> {
-        F::validate(cx)
+        F::validate(&cx.for_source(self.source))
     }
 
     fn future_size(&self, default_limit: usize) -> Option<FutureSize> {
@@ -270,8 +271,8 @@ where
     }
 
     fn into_future(self: Box<Self>, env: RecursiveEnv) -> BoxFuture {
-        let keys = RecursiveKeys::new(&env.cx.client.shared.prefix, &self.key_name);
-        let cx = env.cx.clone();
+        let keys = RecursiveKeys::new(&env.client.shared.prefix, &self.key_name);
+        let cx = RekkaContext::new(env.client.clone(), self.source);
         let rt = Arc::new(RecursiveRt { spec: *self, keys, cx });
         Box::pin(supervised(rt, env))
     }
@@ -433,7 +434,7 @@ where
     async fn run(&self, token: &str, env: &RecursiveEnv) {
         let name = self.spec.name;
         let source = self.spec.source;
-        let shared = &env.cx.client.shared;
+        let shared = &env.client.shared;
         let internal = self.spec.internal;
         let shutdown_timeout = if internal { Some(Duration::ZERO) } else { env.shutdown_timeout };
         let started = Instant::now();
@@ -442,7 +443,7 @@ where
         }
 
         // Fora do scrutinee: o temporário de um `match` vive até o fim do statement, através do `.await`.
-        let called = self.spec.f.call(&env.cx);
+        let called = self.spec.f.call(&self.cx);
         let outcome = match called {
             Err(e) => Err(e.to_string()),
             Ok(fut) => {
@@ -479,7 +480,7 @@ where
         inv.arg(token).arg(self.delay_ms()).arg(millis(self.spec.lease));
         let mut backoff = Backoff::new();
         loop {
-            match inv.invoke_async::<i64>(&mut env.cx.client.conn()).await {
+            match inv.invoke_async::<i64>(&mut env.client.conn()).await {
                 Ok(_) => break,
                 Err(e) if is_transient(&e) && !env.token.is_cancelled() => tokio::select! {
                     _ = sleep(backoff.next_delay()) => {}
@@ -519,7 +520,7 @@ where
     async fn extend(&self, token: &str, env: &RecursiveEnv) {
         let mut inv = self.keys.invocation(&scripts::REC_EXTEND_SCRIPT);
         inv.arg(token).arg(millis(self.spec.lease)).arg(self.delay_ms());
-        match inv.invoke_async::<i64>(&mut env.cx.client.conn()).await {
+        match inv.invoke_async::<i64>(&mut env.client.conn()).await {
             Ok(1) => {}
             // O lock expirou (Redis fora do ar por mais que a lease, restart sem persistência):
             // retomado para nenhuma outra instância começar enquanto esta ainda executa.
